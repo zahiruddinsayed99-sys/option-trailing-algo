@@ -3,21 +3,28 @@ import datetime
 # Execution Mode: "SIMULATION" (local test) ya "OPENALGO" (live feed + paper/live orders)
 MODE = "SIMULATION"
 
-# OpenAlgo Settings (Jab MODE = "OPENALGO" use karein)
+# OpenAlgo Settings
 OPENALGO_API_KEY = "AAPKI_OPENALGO_API_KEY"
 OPENALGO_HOST = "http://127.0.0.1:5000"
 
-# Daily Manual Strike & Risk Parameters
-SYMBOL = "SENSEX26NOV80800PE"  # Strike symbol
+# Default Strike & Risk Parameters (Runtime par override kar sakte hain)
+SYMBOL = "SENSEX26N1982600CE" #"SENSEX26NOV80800PE"
 EXCHANGE = "BFO"  # NFO (Nifty/BankNifty) ya BFO (Sensex)
 QTY = 20  # 1 Lot Sensex = 20, Nifty = 75
 
-# Entry & Risk Rules
-ENTRY_BUFFER_POINTS = 1.0  # Reference high ke kitne points upar entry leni hai
-INITIAL_SL_POINTS = 15.0  # Strict Initial Stop Loss (points)
-TRAIL_STEP_POINTS = 8.0  # Breakeven ke baad har 8 point move par SL trail hoga
-MOVE_TO_BREAKEVEN_AT_1R = True  # 1:1 profit milte hi SL ko Entry Price par layein
+# Entry & Candle Confirmation Rules
+CANDLE_TIMEFRAME_SEC = 180  # 3-minute candle close confirmation
+USE_VWAP_FILTER = True  # Entry sirf tab jab close >= running VWAP
+ENTRY_BUFFER_POINTS = 1.0  # Reference high ke upar buffer
 
-# Time Windows (Aapke disciplined trading window ke hisaab se)
-START_TIME = datetime.time(9, 15)
+# Stop-Loss & Trailing Rules
+INITIAL_SL_POINTS = 15.0  # Strict Initial SL (₹300 risk on 20 qty)
+TRAIL_STEP_POINTS = 8.0  # Breakeven ke baad har 8 pt move par SL trail
+MOVE_TO_BREAKEVEN_AT_1R = True  # 1:1 profit par Cost-to-Cost lock
+
+# Daily Discipline Guardrails (Kill Switch)
+MAX_TRADES_PER_DAY = 3
+MAX_DAILY_LOSS = 800.0  # Max daily loss cap in INR
+TRADING_START_TIME = datetime.time(11, 30)
+TRADING_END_TIME = datetime.time(13, 30)
 SQUARE_OFF_TIME = datetime.time(15, 15)

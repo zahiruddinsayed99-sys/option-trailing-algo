@@ -6,16 +6,32 @@ from broker_adapter import BrokerAdapter
 import config
 
 
+def get_today_stats(csv_file="paper_trades_log.csv"):
+  """Aaj ke completed trades aur total Net P&L check karta hai."""
+  if not os.path.isfile(csv_file):
+    return 0, 0.0
+  today_str = str(datetime.date.today())
+  trades = 0
+  total_pnl = 0.0
+  with open(csv_file, mode="r") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+      if row.get("Date") == today_str:
+        trades += 1
+        total_pnl += float(row.get("Net_PnL", 0.0))
+  return trades, round(total_pnl, 2)
+
+
 def log_trade_to_csv(
     symbol, entry_time, exit_time, entry_p, exit_p, max_p, qty, reason
 ):
-  file_exists = os.path.isfile("paper_trades_log.csv")
+  csv_file = "paper_trades_log.csv"
+  file_exists = os.path.isfile(csv_file)
   gross_pnl = round((exit_p - entry_p) * qty, 2)
-  # Realistic slippage & charges deduction (approx 0.5% of turnover)
   est_charges = round((entry_p + exit_p) * qty * 0.0025, 2)
   net_pnl = round(gross_pnl - est_charges, 2)
 
-  with open("paper_trades_log.csv", mode="a", newline="") as f:
+  with open(csv_file, mode="a", newline="") as f:
     writer = csv.writer(f)
     if not file_exists:
       writer.writerow([
@@ -45,18 +61,56 @@ def log_trade_to_csv(
         reason,
     ])
   print(f"\n[CSV LOGGED] Gross P&L: ₹{gross_pnl} | Net P&L: ₹{net_pnl}")
+  return net_pnl
+
+
+def prompt_runtime_inputs():
+  print("\n--- Daily Strike Setup (Press Enter to keep config default) ---")
+  sym = input(f"Strike Symbol [{config.SYMBOL}]: ").strip().upper()
+  exch = input(f"Exchange [{config.EXCHANGE}]: ").strip().upper()
+  sl_in = input(f"Initial SL Points [{config.INITIAL_SL_POINTS}]: ").strip()
+  trail_in = input(f"Trail Step Points [{config.TRAIL_STEP_POINTS}]: ").strip()
+
+  symbol = sym if sym else config.SYMBOL
+  exchange = exch if exch else config.EXCHANGE
+  sl_pts = float(sl_in) if sl_in else config.INITIAL_SL_POINTS
+  trail_pts = float(trail_in) if trail_in else config.TRAIL_STEP_POINTS
+  return symbol, exchange, sl_pts, trail_pts
 
 
 def run_algo():
+  # Step 1: Daily Kill-Switch Check
+  trades_today, pnl_today = get_today_stats()
+  if trades_today >= config.MAX_TRADES_PER_DAY:
+    print(
+        f"[KILL SWITCH] Max daily trades ({config.MAX_TRADES_PER_DAY})"
+        " reached. Exiting."
+    )
+    return
+  if pnl_today <= -abs(config.MAX_DAILY_LOSS):
+    print(
+        f"[KILL SWITCH] Max daily loss limit (-₹{config.MAX_DAILY_LOSS})"
+        f" breached (Current: ₹{pnl_today}). Exiting."
+    )
+    return
+
+  symbol, exchange, sl_points, trail_step = prompt_runtime_inputs()
   broker = BrokerAdapter()
   print(
-      f"=== Starting Option Algo [{config.MODE} MODE] | Symbol:"
-      f" {config.SYMBOL} ==="
+      f"\n=== Running Algo [{config.MODE}] | {symbol} ({exchange}) | Trades"
+      f" Today: {trades_today}/{config.MAX_TRADES_PER_DAY} | P&L Today:"
+      f" ₹{pnl_today} ==="
   )
 
-  # State Variables
+  # Candle & VWAP State
+  candle_ticks = []
+  ticks_per_candle = 5 if config.MODE == "SIMULATION" else 180
+  completed_candles = 0
   reference_high = 0.0
-  observation_ticks = 0
+  vwap_sum = 0.0
+  vwap_count = 0
+
+  # Trade State
   in_trade = False
   entry_price = 0.0
   entry_time = ""
@@ -68,98 +122,125 @@ def run_algo():
     now_dt = datetime.datetime.now()
     now_time = now_dt.time()
 
-    # Live mode mein market hours check karein
-    if config.MODE == "OPENALGO" and now_time < config.START_TIME:
+    # Live mode session window enforcement
+    if config.MODE == "OPENALGO":
+      if not in_trade and now_time < config.TRADING_START_TIME:
+        print(
+            f"Waiting for trading window ({config.TRADING_START_TIME})...",
+            end="\r",
+        )
+        time.sleep(1)
+        continue
+      if not in_trade and now_time > config.TRADING_END_TIME:
+        print(
+            "\n[SESSION END] Past new-entry cutoff"
+            f" ({config.TRADING_END_TIME}). No new trades."
+        )
+        break
+
+    ltp = broker.get_ltp(symbol, exchange)
+    if ltp is None:
       time.sleep(1)
       continue
 
-    ltp = broker.get_ltp(config.SYMBOL, config.EXCHANGE)
+    # Update Running Session VWAP
+    vwap_sum += ltp
+    vwap_count += 1
+    running_vwap = round(vwap_sum / vwap_count, 2)
 
-    # PHASE 1: Observation Window (Initial Range / Reference High set karna)
-    # Simulation mein pehle 10 ticks observe karega; Live mein pehle 5 mins (300 ticks)
-    obs_limit = 10 if config.MODE == "SIMULATION" else 300
-    if not in_trade and observation_ticks < obs_limit:
-      observation_ticks += 1
-      if ltp > reference_high:
-        reference_high = ltp
-      print(
-          f"[OBSERVING {observation_ticks}/{obs_limit}] LTP: {ltp:.2f} | Ref"
-          f" High: {reference_high:.2f}"
-      )
-      time.sleep(0.5 if config.MODE == "SIMULATION" else 1.0)
-      continue
+    # Build 3-Min Candle
+    candle_ticks.append(ltp)
+    candle_closed = len(candle_ticks) >= ticks_per_candle
 
-    # PHASE 2: Entry Trigger (Reference High + Buffer Breakout)
-    trigger_price = round(reference_high + config.ENTRY_BUFFER_POINTS, 2)
-    if not in_trade:
-      if ltp >= trigger_price:
-        broker.place_order(
-            config.SYMBOL, config.EXCHANGE, "BUY", config.QTY, ltp
-        )
-        in_trade = True
-        entry_price = ltp
-        entry_time = now_time.strftime("%H:%M:%S")
-        current_sl = round(entry_price - config.INITIAL_SL_POINTS, 2)
-        highest_ltp = entry_price
+    if candle_closed:
+      c_open = candle_ticks[0]
+      c_high = max(candle_ticks)
+      c_low = min(candle_ticks)
+      c_close = candle_ticks[-1]
+      completed_candles += 1
+      candle_ticks = []
+
+      # First 2 candles build Reference High
+      if completed_candles <= 2:
+        reference_high = max(reference_high, c_high)
         print(
-            f"\n>>> [ENTRY] BUY {config.SYMBOL} @ {entry_price:.2f} | Trigger:"
-            f" {trigger_price:.2f} | Initial SL: {current_sl:.2f} <<<\n"
+            f"[CANDLE {completed_candles}/2] Close: {c_close:.2f} | Ref High"
+            f" Updated: {reference_high:.2f} | VWAP: {running_vwap:.2f}"
         )
-      else:
-        print(
-            f"[WAITING ENTRY] LTP: {ltp:.2f} | Trigger Needed:"
-            f" {trigger_price:.2f}"
-        )
+        continue
 
-    # PHASE 3: Active Trade Management (Strict SL + Trailing Logic)
-    elif in_trade:
+      # ENTRY CHECK ON 3-MIN CANDLE CLOSE
+      if not in_trade and completed_candles > 2:
+        trigger_level = round(reference_high + config.ENTRY_BUFFER_POINTS, 2)
+        vwap_ok = (c_close >= running_vwap) if config.USE_VWAP_FILTER else True
+
+        if c_close >= trigger_level and vwap_ok:
+          res = broker.place_order(symbol, exchange, "BUY", config.QTY, ltp)
+          if res:
+            in_trade = True
+            entry_price = ltp
+            entry_time = now_time.strftime("%H:%M:%S")
+            current_sl = round(entry_price - sl_points, 2)
+            highest_ltp = entry_price
+            print(
+                f"\n>>> [3M CANDLE BREAKOUT ENTRY] BUY {symbol} @"
+                f" {entry_price:.2f} | Close: {c_close:.2f} > Trigger:"
+                f" {trigger_level:.2f} | VWAP: {running_vwap:.2f} | SL:"
+                f" {current_sl:.2f} <<<\n"
+            )
+        else:
+          print(
+              f"[CANDLE {completed_candles} CLOSE] Close: {c_close:.2f} |"
+              f" Trigger: {trigger_level:.2f} | VWAP: {running_vwap:.2f} (No"
+              " Entry)"
+          )
+
+    # ACTIVE TRADE MANAGEMENT (Tick-by-Tick Strict SL & Trail)
+    if in_trade:
       if ltp > highest_ltp:
         highest_ltp = ltp
 
       profit_pts = highest_ltp - entry_price
 
-      # Rule A: 1:1 Profit par Cost-to-Cost (Breakeven) SL lock karein
+      # 1:1 Breakeven Lock
       if (
           config.MOVE_TO_BREAKEVEN_AT_1R
           and not breakeven_locked
-          and profit_pts >= config.INITIAL_SL_POINTS
+          and profit_pts >= sl_points
       ):
         current_sl = entry_price
         breakeven_locked = True
         print(
-            f"\n>>> [SL TRAIL - BREAKEVEN] 1:1 Target Reached! SL shifted to"
-            f" Entry: {current_sl:.2f} <<<\n"
+            "\n>>> [SL TRAIL - BREAKEVEN] 1:1 Hit! SL locked at Entry:"
+            f" {current_sl:.2f} <<<\n"
         )
 
-      # Rule B: Breakeven ke baad har TRAIL_STEP_POINTS par SL upar shift karein
+      # Step Trailing SL
       elif breakeven_locked:
-        extra_profit = profit_pts - config.INITIAL_SL_POINTS
-        steps = int(extra_profit // config.TRAIL_STEP_POINTS)
-        proposed_sl = round(entry_price + (steps * config.TRAIL_STEP_POINTS), 2)
+        extra_profit = profit_pts - sl_points
+        steps = int(extra_profit // trail_step)
+        proposed_sl = round(entry_price + (steps * trail_step), 2)
         if proposed_sl > current_sl:
           current_sl = proposed_sl
           print(
-              f"\n>>> [SL TRAIL - STEP] High: {highest_ltp:.2f} | New Trailed"
-              f" SL: {current_sl:.2f} <<<\n"
+              f"\n>>> [SL TRAIL - STEP] Peak: {highest_ltp:.2f} | New SL:"
+              f" {current_sl:.2f} <<<\n"
           )
 
-      unrealized_pnl = round((ltp - entry_price) * config.QTY, 2)
+      unrealized = round((ltp - entry_price) * config.QTY, 2)
       print(
-          f"[IN TRADE] LTP: {ltp:.2f} | Entry: {entry_price:.2f} | SL:"
-          f" {current_sl:.2f} | Peak: {highest_ltp:.2f} | Live P&L:"
-          f" ₹{unrealized_pnl}"
+          f"[IN TRADE] LTP: {ltp:.2f} | SL: {current_sl:.2f} | VWAP:"
+          f" {running_vwap:.2f} | Live P&L: ₹{unrealized}"
       )
 
-      # Rule C: Strict SL Hit Check
+      # Strict SL Hit
       if ltp <= current_sl:
-        broker.place_order(
-            config.SYMBOL, config.EXCHANGE, "SELL", config.QTY, ltp
-        )
+        broker.place_order(symbol, exchange, "SELL", config.QTY, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         reason = "Trailed SL Hit" if breakeven_locked else "Initial Strict SL Hit"
         print(f"\n>>> [EXIT - {reason}] Sold @ {ltp:.2f} <<<")
         log_trade_to_csv(
-            config.SYMBOL,
+            symbol,
             entry_time,
             exit_time,
             entry_price,
@@ -170,15 +251,13 @@ def run_algo():
         )
         break
 
-      # Rule D: EOD Square-Off Check (Live Mode)
+      # EOD Auto Square-off
       if config.MODE == "OPENALGO" and now_time >= config.SQUARE_OFF_TIME:
-        broker.place_order(
-            config.SYMBOL, config.EXCHANGE, "SELL", config.QTY, ltp
-        )
+        broker.place_order(symbol, exchange, "SELL", config.QTY, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         print(f"\n>>> [EXIT - EOD SQUARE OFF] Sold @ {ltp:.2f} <<<")
         log_trade_to_csv(
-            config.SYMBOL,
+            symbol,
             entry_time,
             exit_time,
             entry_price,
@@ -189,7 +268,7 @@ def run_algo():
         )
         break
 
-    time.sleep(0.5 if config.MODE == "SIMULATION" else 1.0)
+    time.sleep(0.3 if config.MODE == "SIMULATION" else 1.0)
 
 
 if __name__ == "__main__":

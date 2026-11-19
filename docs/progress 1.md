@@ -1,5 +1,26 @@
-Shoonya account open karne ka decision bilkul practical hai—jab tak account activate hota hai, hum aaj **Phase 3 (Pre-Live Hardening)** complete kar lete hain taaki aapka `option-trailing-algo` production-grade aur battle-ready ho jaye.
+Clean execution! Both simulation runs verified every single Phase 3 guardrail end-to-end:
 
+* **3-Min Candle + VWAP Filter:** Candle 3 stayed below the trigger (`122.99 < 124.84` and `118.90 < 124.75`), correctly holding off until Candle 4 closed above both the Reference High + Buffer and the running VWAP.
+* **Multi-Stage SL Progression:** Locked breakeven at 1:1 (`131.69` / `127.48`), trailed cleanly in 8-point steps (`139.69` $\rightarrow$ `147.69`), and exited immediately when the pullback crossed the trailed SL.
+* **Daily Stateful Kill-Switch:** On your second run, it automatically read `paper_trades_log.csv` and updated the session counter to `Trades Today: 1/3 | P&L Today: ₹283.69`.
+
+### Next Steps to Lock In Phase 3
+
+1. **Commit & Push Phase 3 to GitHub:**
+```bash
+cd ~/trading-projects/option-trailing-algo
+git add config.py broker_adapter.py strategy_engine.py
+git commit -m "feat(phase-3): add 3m candle close + VWAP filter, API retry wrapper, and daily kill-switch"
+git push
+
+```
+
+
+2. **Shoonya Onboarding:** Once your Shoonya account and TOTP 2FA are active, we will plug the Shoonya credentials into `~/trading-projects/openalgo/.env`, verify the OpenAlgo symbol format (e.g., `SENSEX19NOV2682600CE` vs `SENSEX26N1982600CE`—we'll check OpenAlgo's master contract search), and run your first live feed paper test in **Analyze Mode**.
+
+Here is your updated Master Task Checklist with Phase 3 marked complete:
+
+---
 Phase 3 mein hum aapke existing 3 files (`config.py`, `broker_adapter.py`, `strategy_engine.py`) ko in **3 critical upgrades** ke saath update karenge:
 
 1. **API Resilience Wrapper (`broker_adapter.py`):** Shoonya (NorenOMS) mein kabhi-kabhi transient timeout ya packet drop aata hai. Hum `get_ltp` aur `place_order` mein **3-retry loop + exponential backoff** dalenge taaki script kabhi crash na ho.
