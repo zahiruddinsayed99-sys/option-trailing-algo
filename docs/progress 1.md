@@ -1,3 +1,4 @@
+# update 2
 Clean execution! Both simulation runs verified every single Phase 3 guardrail end-to-end:
 
 * **3-Min Candle + VWAP Filter:** Candle 3 stayed below the trigger (`122.99 < 124.84` and `118.90 < 124.75`), correctly holding off until Candle 4 closed above both the Reference High + Buffer and the running VWAP.
