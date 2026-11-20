@@ -5,18 +5,15 @@ import time
 from broker_adapter import BrokerAdapter
 import config
 
-# ==========================================
-# V3 EMOTION-DISCIPLINE PROTOCOL PARAMETERS
-# ==========================================
-MAX_RISK_PCT = 0.13  # Max ~₹760 risk on ₹295 premium (stays under ₹800 daily cap)
-MAX_SPREAD_INDEX = 1.00  # Max Bid-Ask spread for SENSEX/NIFTY (₹)
-MAX_SPREAD_STOCK = 0.15  # Max Bid-Ask spread for Stock Options (₹)
-STAGE1_TRIGGER_PCT = 0.25  # +25% move -> Shift SL to Cost-to-Cost (Breakeven)
-STAGE2_TRIGGER_PCT = 0.50  # +50% move -> Trail by Last 2-Candle Low (min +25% locked)
-STAGE2_LOCK_PCT = 0.25  # Minimum +25% profit floor once Stage 2 activates
-TARGET_2X_MULTIPLIER = 2.0  # +100% (2x) hard profit target
-EMA_PERIOD = 9  # 9 EMA on 3-minute candle closes
-UPPER_WICK_RATIO = 2.0  # Upper wick > 2x body signals climax exhaustion
+MAX_RISK_PCT = 0.13
+MAX_SPREAD_INDEX = 1.00
+MAX_SPREAD_STOCK = 0.15
+STAGE1_TRIGGER_PCT = 0.25
+STAGE2_TRIGGER_PCT = 0.50
+STAGE2_LOCK_PCT = 0.25
+TARGET_2X_MULTIPLIER = 2.0
+EMA_PERIOD = 9
+UPPER_WICK_RATIO = 2.0
 
 
 def calculate_ema(closes, period=9):
@@ -45,16 +42,8 @@ def get_today_stats(csv_file="v3_paper_trades_log.csv"):
 
 
 def log_v3_trade(
-    symbol,
-    entry_time,
-    exit_time,
-    entry_p,
-    exit_p,
-    base_low,
-    max_p,
-    qty,
-    stage_reached,
-    reason,
+    symbol, entry_time, exit_time, entry_p, exit_p,
+    base_low, max_p, qty, stage_reached, reason
 ):
   csv_file = "v3_paper_trades_log.csv"
   file_exists = os.path.isfile(csv_file)
@@ -67,56 +56,25 @@ def log_v3_trade(
     writer = csv.writer(f)
     if not file_exists:
       writer.writerow([
-          "Date",
-          "Symbol",
-          "Entry_Time",
-          "Exit_Time",
-          "Entry_Price",
-          "Base_Low",
-          "Risk_Pct",
-          "Exit_Price",
-          "Highest_Price",
-          "Qty",
-          "Gross_PnL",
-          "Net_PnL",
-          "Highest_Stage",
-          "Exit_Reason",
+          "Date", "Symbol", "Entry_Time", "Exit_Time", "Entry_Price",
+          "Base_Low", "Risk_Pct", "Exit_Price", "Highest_Price", "Qty",
+          "Gross_PnL", "Net_PnL", "Highest_Stage", "Exit_Reason"
       ])
     writer.writerow([
-        datetime.date.today(),
-        symbol,
-        entry_time,
-        exit_time,
-        entry_p,
-        base_low,
-        risk_pct,
-        exit_p,
-        max_p,
-        qty,
-        gross_pnl,
-        net_pnl,
-        stage_reached,
-        reason,
+        datetime.date.today(), symbol, entry_time, exit_time, entry_p,
+        base_low, risk_pct, exit_p, max_p, qty, gross_pnl, net_pnl,
+        stage_reached, reason
     ])
-  print(
-      f"\n[V3 CSV LOGGED] Gross P&L: ₹{gross_pnl} | Net P&L: ₹{net_pnl} | Stage:"
-      f" {stage_reached}"
-  )
+  print(f"\n[V3 CSV LOGGED] Gross P&L: ₹{gross_pnl} | Net P&L: ₹{net_pnl} | Stage: {stage_reached}")
 
 
 def run_v3_strategy():
   trades_today, pnl_today = get_today_stats()
   if trades_today >= config.MAX_TRADES_PER_DAY:
-    print(
-        f"[KILL SWITCH] Max daily trades ({config.MAX_TRADES_PER_DAY})"
-        " reached. Exiting."
-    )
+    print(f"[KILL SWITCH] Max daily trades ({config.MAX_TRADES_PER_DAY}) reached. Exiting.")
     return
   if pnl_today <= -abs(config.MAX_DAILY_LOSS):
-    print(
-        f"[KILL SWITCH] Max daily loss (-₹{config.MAX_DAILY_LOSS}) breached."
-        " Exiting."
-    )
+    print(f"[KILL SWITCH] Max daily loss (-₹{config.MAX_DAILY_LOSS}) breached. Exiting.")
     return
 
   print("\n=== V3 EMOTION-FREE MOMENTUM ENGINE SETUP ===")
@@ -136,22 +94,19 @@ def run_v3_strategy():
   broker = BrokerAdapter()
   print(
       f"\n>>> Starting V3 Engine [{config.MODE}] | {symbol} ({exchange}) | Max"
-      f" Spread: ₹{max_spread} | Trades: {trades_today}/{config.MAX_TRADES_PER_DAY}"
-      " <<<"
+      f" Spread: ₹{max_spread} | Trades: {trades_today}/{config.MAX_TRADES_PER_DAY} <<<"
   )
 
-  # 3-Minute OHLC History & Base State
-  candles = []  # List of dicts: {'open', 'high', 'low', 'close'}
+  candles = []
   current_ticks = []
   candle_start_dt = datetime.datetime.now()
   ticks_per_candle = 5 if config.MODE == "SIMULATION" else 180
-  base_candles_needed = 4
+  min_base_candles = 4
 
   base_high = 0.0
   base_low = float("inf")
   base_locked = False
 
-  # Trade State
   in_trade = False
   entry_price = 0.0
   entry_time = ""
@@ -164,16 +119,13 @@ def run_v3_strategy():
     now_dt = datetime.datetime.now()
     now_time = now_dt.time()
 
-    # Freeze Hour & Execution Window Enforcement (Live Mode)
     if config.MODE == "OPENALGO":
       if now_time < datetime.time(10, 30):
         print("Waiting for 10:30 AM Freeze Hour observation window...", end="\r")
         time.sleep(1)
         continue
       if not in_trade and now_time > config.TRADING_END_TIME:
-        print(
-            "\n[SESSION END] Past 13:30 IST execution cutoff. No new trades."
-        )
+        print("\n[SESSION END] Past 13:30 IST execution cutoff. No new trades.")
         break
 
     ltp = broker.get_ltp(symbol, exchange)
@@ -183,9 +135,6 @@ def run_v3_strategy():
 
     current_ticks.append(ltp)
 
-    # ==========================================
-    # 3-MINUTE CANDLE CLOSE PROCESSING (WALL-CLOCK)
-    # ==========================================
     candle_ready = (
         len(current_ticks) >= ticks_per_candle
         if config.MODE == "SIMULATION"
@@ -204,30 +153,28 @@ def run_v3_strategy():
       candle_start_dt = now_dt
       ema_9 = calculate_ema([c["close"] for c in candles], EMA_PERIOD)
 
-      # PHASE A: FREEZE HOUR BASE (Accumulates all 3m candles until 11:30 AM in live mode)
-      is_observing = (
-          len(candles) <= base_candles_needed
-          if config.MODE == "SIMULATION"
-          else (now_time < config.TRADING_START_TIME and not base_locked)
+      # Always require at least 4 base candles AND wait until >= 11:30 AM in live mode
+      still_building_base = (
+          len(candles) <= min_base_candles
+          or (config.MODE == "OPENALGO" and now_time < config.TRADING_START_TIME)
       )
 
-      if is_observing:
+      if not base_locked and still_building_base:
         base_high = max(base_high, candle["high"])
         base_low = min(base_low, candle["low"])
         print(
-            f"[FREEZE BASE #{len(candles)}] Close: {candle['close']:.2f} | Base"
+            f"[BASE OBSERVE #{len(candles)}] Close: {candle['close']:.2f} | Base"
             f" Range: [{base_low:.2f} - {base_high:.2f}]"
         )
         continue
 
-      if not base_locked and len(candles) > 0:
+      if not base_locked:
         base_locked = True
         print(
-            f"\n>>> [11:30 BASE LOCKED] Breakout Trigger > {base_high:.2f} | Base"
+            f"\n>>> [BASE LOCKED] Breakout Trigger > {base_high:.2f} | Base"
             f" Low SL: {base_low:.2f} <<<\n"
         )
 
-      # PHASE B: BREAKOUT ENTRY & <13% RISK FILTER (Execution Window 11:30 - 13:30)
       if base_locked and not in_trade:
         in_exec_window = (
             True
@@ -247,7 +194,6 @@ def run_v3_strategy():
             )
             break
 
-          # Place Limit Buy at Breakout Candle Close
           res = broker.place_order(
               symbol, exchange, "BUY", qty, round(proposed_entry + 0.05, 2)
           )
@@ -270,9 +216,7 @@ def run_v3_strategy():
               f" {base_high:.2f} | 9 EMA: {ema_9}"
           )
 
-      # PHASE C: CANDLE-CLOSE EXIT CHECKS (Stage 3: 9 EMA & Stage 4: Climax Rejection)
       elif in_trade:
-        # Stage 2+: Update SL to Low of Last 2 Candles (never below +25% profit floor)
         if stage in ["STAGE_2_TRAIL", "STAGE_3_EMA_RIDE"] and len(candles) >= 2:
           last_2_low = min(candles[-1]["low"], candles[-2]["low"])
           floor_25 = round(entry_price * (1 + STAGE2_LOCK_PCT), 2)
@@ -284,7 +228,6 @@ def run_v3_strategy():
                 f" {current_sl:.2f} <<<\n"
             )
 
-        # Stage 3: Hold Above 9 EMA (Exit if 3m candle closes below 9 EMA once in Stage 2+)
         if (
             stage in ["STAGE_2_TRAIL", "STAGE_3_EMA_RIDE"]
             and ema_9 is not None
@@ -297,20 +240,11 @@ def run_v3_strategy():
               f" < 9 EMA {ema_9:.2f} | Sold @ {ltp:.2f} <<<"
           )
           log_v3_trade(
-              symbol,
-              entry_time,
-              exit_time,
-              entry_price,
-              ltp,
-              base_low,
-              highest_ltp,
-              qty,
-              stage,
-              "3m Close Below 9 EMA",
+              symbol, entry_time, exit_time, entry_price, ltp,
+              base_low, highest_ltp, qty, stage, "3m Close Below 9 EMA"
           )
           break
 
-        # Stage 4: Climax Rejection (Previous candle had extended upper wick, current breaks its low)
         if len(candles) >= 2:
           prev = candles[-2]
           prev_body = abs(prev["close"] - prev["open"])
@@ -327,29 +261,17 @@ def run_v3_strategy():
                 f" {prev['low']:.2f} | Sold @ {ltp:.2f} <<<"
             )
             log_v3_trade(
-                symbol,
-                entry_time,
-                exit_time,
-                entry_price,
-                ltp,
-                base_low,
-                highest_ltp,
-                qty,
-                "STAGE_4_CLIMAX",
-                "Climax Wick Rejection",
+                symbol, entry_time, exit_time, entry_price, ltp,
+                base_low, highest_ltp, qty, "STAGE_4_CLIMAX", "Climax Wick Rejection"
             )
             break
 
-    # ==========================================
-    # TICK-BY-TICK MILESTONES & HARD SL CHECKS
-    # ==========================================
     if in_trade:
       if ltp > highest_ltp:
         highest_ltp = ltp
 
       gain_pct = (highest_ltp - entry_price) / entry_price
 
-      # Stage 1 (+25% to +30%): Move SL to Cost-to-Cost (Risk-Free)
       if gain_pct >= STAGE1_TRIGGER_PCT and stage == "INITIAL_BASE_SL":
         current_sl = entry_price
         stage = "STAGE_1_BREAKEVEN"
@@ -358,7 +280,6 @@ def run_v3_strategy():
             f" {current_sl:.2f} (100% Risk-Free) <<<\n"
         )
 
-      # Stage 2 (+50% Move): Lock +25% floor & activate 2-Candle Low + 9 EMA trail
       if gain_pct >= STAGE2_TRIGGER_PCT and stage == "STAGE_1_BREAKEVEN":
         floor_25 = round(entry_price * (1 + STAGE2_LOCK_PCT), 2)
         last_2_low = (
@@ -373,7 +294,6 @@ def run_v3_strategy():
             f" {current_sl:.2f} | Riding 9 EMA <<<\n"
         )
 
-      # Stage 4 (2x Target Hit)
       if ltp >= target_2x:
         broker.place_order(symbol, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
@@ -382,16 +302,8 @@ def run_v3_strategy():
             f" {ltp:.2f} <<<"
         )
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            base_low,
-            highest_ltp,
-            qty,
-            "STAGE_4_2X_TARGET",
-            "2x Target Hit (+100%)",
+            symbol, entry_time, exit_time, entry_price, ltp,
+            base_low, highest_ltp, qty, "STAGE_4_2X_TARGET", "2x Target Hit (+100%)"
         )
         break
 
@@ -401,40 +313,22 @@ def run_v3_strategy():
           f" | SL: {current_sl:.2f} | 2x: {target_2x:.2f} | P&L: ₹{live_pnl}"
       )
 
-      # Hard Stop-Loss Hit
       if ltp <= current_sl:
         broker.place_order(symbol, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         print(f"\n>>> [HARD SL EXIT] Triggered @ {ltp:.2f} (SL: {current_sl:.2f}) <<<")
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            base_low,
-            highest_ltp,
-            qty,
-            stage,
-            f"SL Hit ({stage})",
+            symbol, entry_time, exit_time, entry_price, ltp,
+            base_low, highest_ltp, qty, stage, f"SL Hit ({stage})"
         )
         break
 
-      # EOD Square-Off
       if config.MODE == "OPENALGO" and now_time >= config.SQUARE_OFF_TIME:
         broker.place_order(symbol, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            base_low,
-            highest_ltp,
-            qty,
-            stage,
-            "EOD Square-Off",
+            symbol, entry_time, exit_time, entry_price, ltp,
+            base_low, highest_ltp, qty, stage, "EOD Square-Off"
         )
         break
 
@@ -443,4 +337,3 @@ def run_v3_strategy():
 
 if __name__ == "__main__":
   run_v3_strategy()
-EOF
