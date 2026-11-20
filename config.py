@@ -1,7 +1,7 @@
 import datetime
 
 # Execution Mode: "SIMULATION" (local test) ya "OPENALGO" (live feed + paper/live orders)
-MODE = "OPENALGO"
+MODE = "OPENALGO"  # "SIMULATION" or "OPENALGO" 
 
 # static ip 
 STATIC_IP = "103.248.74.138"
@@ -32,3 +32,13 @@ MAX_DAILY_LOSS = 800.0  # Max daily loss cap in INR
 TRADING_START_TIME = datetime.time(11, 30)
 TRADING_END_TIME = datetime.time(13, 30)
 SQUARE_OFF_TIME = datetime.time(15, 15)
+# Multi-Strike Auto-Rotation Watchlist (Ordered: Closest OTM -> Deeper OTM)
+CANDIDATE_STRIKES = [
+    "SENSEX26NOV2684900CE",
+    "SENSEX26NOV2685000CE",
+    "SENSEX26NOV2685100CE",
+    "SENSEX26NOV2685200CE",
+    "SENSEX26NOV2685300CE",
+]
+PREMIUM_MAX_THRESHOLD = 330.0  # Rotate to next OTM strike if LTP exceeds ₹330
+PREMIUM_MIN_THRESHOLD = 140.0  # Rotate back to closer strike if LTP drops below ₹140

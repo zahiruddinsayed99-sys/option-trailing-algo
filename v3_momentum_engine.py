@@ -6,18 +6,18 @@ from broker_adapter import BrokerAdapter
 import config
 
 # ==========================================
-# V3 EMOTION-DISCIPLINE PROTOCOL PARAMETERS
+# V3.1 MULTI-STRIKE MOMENTUM PROTOCOL PARAMETERS
 # ==========================================
-MAX_SL_POINTS = 25.0  # Max ₹500 risk on 20 qty SENSEX (caps wide bases cleanly)
-MAX_CHASE_PCT = 0.05  # Skip candle if close jumps > 5% above Base High
-MAX_SPREAD_INDEX = 1.00  # Max Bid-Ask spread for SENSEX/NIFTY (₹)
-MAX_SPREAD_STOCK = 0.15  # Max Bid-Ask spread for Stock Options (₹)
-STAGE1_TRIGGER_PCT = 0.25  # +25% move -> Shift SL to Cost-to-Cost (Breakeven)
-STAGE2_TRIGGER_PCT = 0.50  # +50% move -> Trail by Last 2-Candle Low (min +25% locked)
-STAGE2_LOCK_PCT = 0.25  # Minimum +25% profit floor once Stage 2 activates
-TARGET_2X_MULTIPLIER = 2.0  # +100% (2x) hard profit target
-EMA_PERIOD = 9  # 9 EMA on 3-minute candle closes
-UPPER_WICK_RATIO = 2.0  # Upper wick >= 2x body signals climax exhaustion
+MAX_SL_POINTS = 25.0         # Max ₹500 risk on 20 qty SENSEX (caps wide bases)
+MAX_CHASE_PCT = 0.05         # Skip candle if close jumps > 5% above Base High
+MAX_SPREAD_INDEX = 1.00      # Max Bid-Ask spread for SENSEX/NIFTY (₹)
+MAX_SPREAD_STOCK = 0.15      # Max Bid-Ask spread for Stock Options (₹)
+STAGE1_RR_MULTIPLIER = 1.5   # 1:1.5 R:R -> Shift SL to Cost-to-Cost (Breakeven)
+STAGE2_TRIGGER_PCT = 0.50    # +50% move -> Trail by Last 2-Candle Low (min +25% locked)
+STAGE2_LOCK_PCT = 0.25       # Minimum +25% profit floor once Stage 2 activates
+TARGET_2X_MULTIPLIER = 2.0   # +100% (2x) hard profit target
+EMA_PERIOD = 9               # 9 EMA on 3-minute candle closes
+UPPER_WICK_RATIO = 2.0       # Upper wick >= 2x body signals climax exhaustion
 
 
 def calculate_ema(closes, period=9):
@@ -46,16 +46,8 @@ def get_today_stats(csv_file="v3_paper_trades_log.csv"):
 
 
 def log_v3_trade(
-    symbol,
-    entry_time,
-    exit_time,
-    entry_p,
-    exit_p,
-    initial_sl,
-    max_p,
-    qty,
-    stage_reached,
-    reason,
+    symbol, entry_time, exit_time, entry_p, exit_p,
+    initial_sl, max_p, qty, stage_reached, reason
 ):
   csv_file = "v3_paper_trades_log.csv"
   file_exists = os.path.isfile(csv_file)
@@ -68,218 +60,279 @@ def log_v3_trade(
     writer = csv.writer(f)
     if not file_exists:
       writer.writerow([
-          "Date",
-          "Symbol",
-          "Entry_Time",
-          "Exit_Time",
-          "Entry_Price",
-          "Initial_SL",
-          "Risk_Pct",
-          "Exit_Price",
-          "Highest_Price",
-          "Qty",
-          "Gross_PnL",
-          "Net_PnL",
-          "Highest_Stage",
-          "Exit_Reason",
+          "Date", "Symbol", "Entry_Time", "Exit_Time", "Entry_Price",
+          "Initial_SL", "Risk_Pct", "Exit_Price", "Highest_Price", "Qty",
+          "Gross_PnL", "Net_PnL", "Highest_Stage", "Exit_Reason"
       ])
     writer.writerow([
-        datetime.date.today(),
-        symbol,
-        entry_time,
-        exit_time,
-        entry_p,
-        initial_sl,
-        risk_pct,
-        exit_p,
-        max_p,
-        qty,
-        gross_pnl,
-        net_pnl,
-        stage_reached,
-        reason,
+        datetime.date.today(), symbol, entry_time, exit_time, entry_p,
+        initial_sl, risk_pct, exit_p, max_p, qty, gross_pnl, net_pnl,
+        stage_reached, reason
     ])
   print(
-      f"\n[V3 CSV LOGGED] Gross P&L: ₹{gross_pnl} | Net P&L: ₹{net_pnl} | Stage:"
-      f" {stage_reached}"
+      f"\n[V3.1 CSV LOGGED] {symbol} | Gross: ₹{gross_pnl} | Net: ₹{net_pnl} |"
+      f" Stage: {stage_reached}"
   )
 
 
 def run_v3_strategy():
   trades_today, pnl_today = get_today_stats()
   if trades_today >= config.MAX_TRADES_PER_DAY:
-    print(
-        f"[KILL SWITCH] Max daily trades ({config.MAX_TRADES_PER_DAY})"
-        " reached. Exiting."
-    )
+    print(f"[KILL SWITCH] Max daily trades ({config.MAX_TRADES_PER_DAY}) reached.")
     return
   if pnl_today <= -abs(config.MAX_DAILY_LOSS):
-    print(
-        f"[KILL SWITCH] Max daily loss (-₹{config.MAX_DAILY_LOSS}) breached."
-        " Exiting."
-    )
+    print(f"[KILL SWITCH] Max daily loss (-₹{config.MAX_DAILY_LOSS}) breached.")
     return
 
-  print("\n=== V3 EMOTION-FREE MOMENTUM ENGINE SETUP ===")
-  sym_in = input(f"Candidate Strike [{config.SYMBOL}]: ").strip().upper()
+  default_list = getattr(config, "CANDIDATE_STRIKES", [config.SYMBOL])
+  default_str = ",".join(default_list)
+  max_prem = getattr(config, "PREMIUM_MAX_THRESHOLD", 330.0)
+  min_prem = getattr(config, "PREMIUM_MIN_THRESHOLD", 140.0)
+
+  print("\n=== V3.1 MULTI-STRIKE MOMENTUM ENGINE SETUP ===")
+  sym_in = input(f"Candidate Strikes [{default_str}]: ").strip().upper()
   exch_in = input(f"Exchange [{config.EXCHANGE}]: ").strip().upper()
   qty_in = input(f"Quantity [{config.QTY}]: ").strip()
 
-  symbol = sym_in if sym_in else config.SYMBOL
+  strikes = [s.strip() for s in sym_in.split(",") if s.strip()] if sym_in else default_list
   exchange = exch_in if exch_in else config.EXCHANGE
   qty = int(qty_in) if qty_in else config.QTY
   max_spread = (
       MAX_SPREAD_INDEX
-      if any(idx in symbol for idx in ["SENSEX", "NIFTY", "BANKNIFTY"])
+      if any(idx in strikes[0] for idx in ["SENSEX", "NIFTY", "BANKNIFTY"])
       else MAX_SPREAD_STOCK
   )
 
   broker = BrokerAdapter()
   print(
-      f"\n>>> Starting V3 Engine [{config.MODE}] | {symbol} ({exchange}) | Max"
-      f" SL Cap: {MAX_SL_POINTS} pts | Trades:"
+      f"\n>>> Starting V3.1 Engine [{config.MODE}] | {len(strikes)} Strikes"
+      f" Watched | Band: ₹{min_prem}-₹{max_prem} | Trades:"
       f" {trades_today}/{config.MAX_TRADES_PER_DAY} <<<"
   )
 
-  # 3-Minute OHLC History & Base State
-  candles = []
-  current_ticks = []
+  # Parallel Per-Strike State (Each strike tracks its own 3m candles & Base High/Low)
+  state = {
+      s: {
+          "candles": [],
+          "ticks": [],
+          "base_high": 0.0,
+          "base_low": float("inf"),
+          "base_locked": False,
+          "last_quote": None,
+      }
+      for s in strikes
+  }
+
+  active_idx = 0
+  active_sym = strikes[active_idx]
   candle_start_dt = datetime.datetime.now()
   ticks_per_candle = 5 if config.MODE == "SIMULATION" else 180
   min_base_candles = 4
 
-  base_high = 0.0
-  base_low = float("inf")
-  base_locked = False
-
-  # Trade State
+  # Active Trade State
   in_trade = False
   entry_price = 0.0
   initial_sl_price = 0.0
+  be_trigger_price = 0.0
   entry_time = ""
   current_sl = 0.0
   target_2x = 0.0
   highest_ltp = 0.0
   stage = "BASE_OBSERVATION"
 
+  def reset_trade_state():
+    nonlocal in_trade, entry_price, initial_sl_price, be_trigger_price
+    nonlocal entry_time, current_sl, target_2x, highest_ltp, stage
+    in_trade = False
+    entry_price = 0.0
+    initial_sl_price = 0.0
+    be_trigger_price = 0.0
+    entry_time = ""
+    current_sl = 0.0
+    target_2x = 0.0
+    highest_ltp = 0.0
+    stage = "SCANNING"
+
   while True:
     now_dt = datetime.datetime.now()
     now_time = now_dt.time()
 
-    # Freeze Hour & Execution Window Enforcement (Live Mode)
-    if config.MODE == "OPENALGO":
-      if now_time < datetime.time(10, 30):
-        print("Waiting for 10:30 AM Freeze Hour observation window...", end="\r")
-        time.sleep(1)
-        continue
-      if not in_trade and now_time > config.TRADING_END_TIME:
-        print(
-            "\n[SESSION END] Past 13:30 IST execution cutoff. No new trades."
-        )
+    # Check Daily Kill-Switches before scanning
+    trades_today, pnl_today = get_today_stats()
+    if not in_trade:
+      if trades_today >= config.MAX_TRADES_PER_DAY:
+        print(f"\n[KILL SWITCH] Daily trade cap ({config.MAX_TRADES_PER_DAY}) reached. Stopping.")
         break
+      if pnl_today <= -abs(config.MAX_DAILY_LOSS):
+        print(f"\n[KILL SWITCH] Daily loss limit (-₹{config.MAX_DAILY_LOSS}) breached. Stopping.")
+        break
+      if config.MODE == "OPENALGO":
+        if now_time < datetime.time(10, 30):
+          print("Waiting for 10:30 AM Freeze Hour observation window...", end="\r")
+          time.sleep(1)
+          continue
+        if now_time > config.TRADING_END_TIME:
+          print("\n[SESSION END] Past 13:30 IST execution cutoff. No new trades.")
+          break
 
-    ltp = broker.get_ltp(symbol, exchange)
-    if ltp is None:
+    # Fetch live quotes for all candidate strikes (when flat) or active strike (when in trade)
+    symbols_to_poll = [active_sym] if in_trade else strikes
+    for s in symbols_to_poll:
+      q = broker.get_quote(s, exchange)
+      if q:
+        state[s]["last_quote"] = q
+        state[s]["ticks"].append(q["ltp"])
+
+    active_q = state[active_sym]["last_quote"]
+    if not active_q:
       time.sleep(1)
       continue
 
-    current_ticks.append(ltp)
+    # ==========================================
+    # DYNAMIC OTM AUTO-ROTATION (ONLY WHEN FLAT)
+    # ==========================================
+    if not in_trade:
+      curr_ltp = active_q["ltp"]
+      # 1. Premium exceeded upper threshold -> rotate to next further OTM strike
+      if curr_ltp > max_prem and active_idx < len(strikes) - 1:
+        for next_i in range(active_idx + 1, len(strikes)):
+          cand_s = strikes[next_i]
+          cand_q = state[cand_s]["last_quote"]
+          if cand_q and cand_q["ltp"] <= max_prem and cand_q["spread"] <= max_spread:
+            print(
+                f"\n>>> [OTM ROTATE UP] {active_sym} LTP ₹{curr_ltp:.2f} > ₹{max_prem:.0f}."
+                f" Switching to {cand_s} @ ₹{cand_q['ltp']:.2f} <<<\n"
+            )
+            active_idx = next_i
+            active_sym = cand_s
+            active_q = cand_q
+            break
+
+      # 2. Premium decayed below lower threshold -> rotate back to closer strike
+      elif curr_ltp < min_prem and active_idx > 0:
+        for prev_i in range(active_idx - 1, -1, -1):
+          cand_s = strikes[prev_i]
+          cand_q = state[cand_s]["last_quote"]
+          if cand_q and min_prem <= cand_q["ltp"] <= max_prem and cand_q["spread"] <= max_spread:
+            print(
+                f"\n>>> [OTM ROTATE DOWN] {active_sym} LTP ₹{curr_ltp:.2f} < ₹{min_prem:.0f}."
+                f" Switching to {cand_s} @ ₹{cand_q['ltp']:.2f} <<<\n"
+            )
+            active_idx = prev_i
+            active_sym = cand_s
+            active_q = cand_q
+            break
 
     # ==========================================
-    # 3-MINUTE CANDLE CLOSE PROCESSING (WALL-CLOCK)
+    # 3-MINUTE WALL-CLOCK CANDLE CLOSE (ALL STRIKES)
     # ==========================================
+    active_ticks = state[active_sym]["ticks"]
     candle_ready = (
-        len(current_ticks) >= ticks_per_candle
+        len(active_ticks) >= ticks_per_candle
         if config.MODE == "SIMULATION"
         else (now_dt - candle_start_dt).total_seconds() >= 180
     )
 
-    if candle_ready and current_ticks:
-      candle = {
-          "open": current_ticks[0],
-          "high": max(current_ticks),
-          "low": min(current_ticks),
-          "close": current_ticks[-1],
-      }
-      candles.append(candle)
-      current_ticks = []
+    if candle_ready and active_ticks:
       candle_start_dt = now_dt
-      ema_9 = calculate_ema([c["close"] for c in candles], EMA_PERIOD)
+      for s in symbols_to_poll:
+        t_list = state[s]["ticks"]
+        if not t_list:
+          continue
+        c_bar = {
+            "open": t_list[0],
+            "high": max(t_list),
+            "low": min(t_list),
+            "close": t_list[-1],
+        }
+        state[s]["candles"].append(c_bar)
+        state[s]["ticks"] = []
 
-      # PHASE A: BASE OBSERVATION (10:30-11:30 Freeze Hour OR min 4 candles if started late)
-      still_building_base = (
-          len(candles) <= min_base_candles
-          or (config.MODE == "OPENALGO" and now_time < config.TRADING_START_TIME)
-      )
+        # Build Freeze-Hour / Min-4-Candle Base per strike
+        still_building = (
+            len(state[s]["candles"]) <= min_base_candles
+            or (config.MODE == "OPENALGO" and now_time < config.TRADING_START_TIME)
+        )
+        if not state[s]["base_locked"] and still_building:
+          state[s]["base_high"] = max(state[s]["base_high"], c_bar["high"])
+          state[s]["base_low"] = min(state[s]["base_low"], c_bar["low"])
+        elif not state[s]["base_locked"]:
+          state[s]["base_locked"] = True
 
-      if not base_locked and still_building_base:
-        base_high = max(base_high, candle["high"])
-        base_low = min(base_low, candle["low"])
+      act = state[active_sym]
+      act_candles = act["candles"]
+      act_candle = act_candles[-1]
+      ema_9 = calculate_ema([c["close"] for c in act_candles], EMA_PERIOD)
+
+      if not act["base_locked"]:
         print(
-            f"[BASE OBSERVE #{len(candles)}] Close: {candle['close']:.2f} | Base"
-            f" Range: [{base_low:.2f} - {base_high:.2f}]"
+            f"[BASE OBSERVE #{len(act_candles)} | {active_sym}] Close:"
+            f" {act_candle['close']:.2f} | Base: [{act['base_low']:.2f} -"
+            f" {act['base_high']:.2f}]"
         )
         continue
 
-      if not base_locked:
-        base_locked = True
-        print(
-            f"\n>>> [BASE LOCKED] Breakout Trigger > {base_high:.2f} | Base"
-            f" Low: {base_low:.2f} (SL capped at max {MAX_SL_POINTS} pts) <<<\n"
-        )
-
-      # PHASE B: BREAKOUT ENTRY & DUAL-CAP RISK FILTER (Execution Window 11:30 - 13:30)
-      if base_locked and not in_trade:
+      # PHASE B: BREAKOUT ENTRY WITH SPREAD GATE & DUAL-CAP SL
+      if act["base_locked"] and not in_trade:
         in_exec_window = (
             True
             if config.MODE == "SIMULATION"
             else (config.TRADING_START_TIME <= now_time <= config.TRADING_END_TIME)
         )
 
-        if in_exec_window and candle["close"] > base_high:
-          proposed_entry = candle["close"]
-          chase_pct = (proposed_entry - base_high) / base_high
+        if in_exec_window and act_candle["close"] > act["base_high"]:
+          proposed_entry = act_candle["close"]
+          chase_pct = (proposed_entry - act["base_high"]) / act["base_high"]
 
           if chase_pct > MAX_CHASE_PCT:
             print(
-                f"\n[TRADE SKIPPED - CHASE GUARD] Close {proposed_entry:.2f} is"
-                f" {chase_pct*100:.1f}% above Base High {base_high:.2f}. Waiting"
-                " for next setup..."
+                f"\n[SKIP - CHASE GUARD] {active_sym} close {proposed_entry:.2f} is"
+                f" {chase_pct*100:.1f}% above Base High {act['base_high']:.2f}."
             )
             continue
 
-          # Cap SL at max 25 pts (₹500 on 20 qty) if Base Low is wider than ₹500 risk
-          capped_sl = round(max(base_low, proposed_entry - MAX_SL_POINTS), 2)
-          risk_pct = (proposed_entry - capped_sl) / proposed_entry
+          if active_q["spread"] > max_spread:
+            print(
+                f"\n[SKIP - WIDE SPREAD] {active_sym} spread ₹{active_q['spread']:.2f}"
+                f" > max ₹{max_spread:.2f}."
+            )
+            continue
+
+          capped_sl = round(max(act["base_low"], proposed_entry - MAX_SL_POINTS), 2)
+          risk_pts = round(proposed_entry - capped_sl, 2)
+          if risk_pts <= 0:
+            continue
 
           res = broker.place_order(
-              symbol, exchange, "BUY", qty, round(proposed_entry + 0.05, 2)
+              active_sym, exchange, "BUY", qty, round(proposed_entry + 0.05, 2)
           )
           if res:
             in_trade = True
             entry_price = proposed_entry
             initial_sl_price = capped_sl
+            be_trigger_price = round(entry_price + (STAGE1_RR_MULTIPLIER * risk_pts), 2)
             entry_time = now_time.strftime("%H:%M:%S")
             current_sl = capped_sl
             target_2x = round(entry_price * TARGET_2X_MULTIPLIER, 2)
             highest_ltp = entry_price
             stage = "INITIAL_BASE_SL"
             print(
-                f"\n>>> [V3 ENTRY] BUY {symbol} @ {entry_price:.2f} | Risk:"
-                f" {risk_pct*100:.1f}% ({entry_price - current_sl:.2f} pts) |"
-                f" Hard SL: {current_sl:.2f} | 2x Target: {target_2x:.2f} <<<\n"
+                f"\n>>> [V3.1 ENTRY] BUY {active_sym} @ {entry_price:.2f} | Risk:"
+                f" {risk_pts:.2f} pts (₹{risk_pts*qty:.0f}) | SL: {current_sl:.2f}"
+                f" | 1:1.5 BE @ {be_trigger_price:.2f} | 2x: {target_2x:.2f} <<<\n"
             )
         else:
           print(
-              f"[SCANNING 3M] Close: {candle['close']:.2f} | Base High:"
-              f" {base_high:.2f} | 9 EMA: {ema_9}"
+              f"[SCANNING 3M | {active_sym}] Close: {act_candle['close']:.2f} |"
+              f" Base High: {act['base_high']:.2f} | 9 EMA: {ema_9} | Spread:"
+              f" ₹{active_q['spread']:.2f}"
           )
 
-      # PHASE C: CANDLE-CLOSE EXIT CHECKS (Stage 3: 9 EMA & Stage 4: Climax Rejection)
+      # PHASE C: CANDLE-CLOSE EXIT CHECKS (Stage 2 Trail, Stage 3 9-EMA, Stage 4 Climax)
       elif in_trade:
-        # Stage 2+: Update SL to Low of Last 2 Candles (never below +25% profit floor)
-        if stage in ["STAGE_2_TRAIL", "STAGE_3_EMA_RIDE"] and len(candles) >= 2:
-          last_2_low = min(candles[-1]["low"], candles[-2]["low"])
+        ltp = active_q["ltp"]
+        if stage in ["STAGE_2_TRAIL", "STAGE_3_EMA_RIDE"] and len(act_candles) >= 2:
+          last_2_low = min(act_candles[-1]["low"], act_candles[-2]["low"])
           floor_25 = round(entry_price * (1 + STAGE2_LOCK_PCT), 2)
           new_sl = round(max(last_2_low, floor_25), 2)
           if new_sl > current_sl:
@@ -289,77 +342,63 @@ def run_v3_strategy():
                 f" {current_sl:.2f} <<<\n"
             )
 
-        # Stage 3: Hold Above 9 EMA (Exit if 3m candle closes below 9 EMA once in Stage 2+)
         if (
             stage in ["STAGE_2_TRAIL", "STAGE_3_EMA_RIDE"]
             and ema_9 is not None
-            and candle["close"] < ema_9
+            and act_candle["close"] < ema_9
         ):
-          broker.place_order(symbol, exchange, "SELL", qty, ltp)
+          broker.place_order(active_sym, exchange, "SELL", qty, ltp)
           exit_time = now_time.strftime("%H:%M:%S")
           print(
-              f"\n>>> [STAGE 3 EXIT - 9 EMA BREAK] Close {candle['close']:.2f}"
+              f"\n>>> [STAGE 3 EXIT - 9 EMA BREAK] Close {act_candle['close']:.2f}"
               f" < 9 EMA {ema_9:.2f} | Sold @ {ltp:.2f} <<<"
           )
           log_v3_trade(
-              symbol,
-              entry_time,
-              exit_time,
-              entry_price,
-              ltp,
-              initial_sl_price,
-              highest_ltp,
-              qty,
-              stage,
-              "3m Close Below 9 EMA",
+              active_sym, entry_time, exit_time, entry_price, ltp,
+              initial_sl_price, highest_ltp, qty, stage, "3m Close Below 9 EMA"
           )
-          break
+          reset_trade_state()
+          continue
 
-        # Stage 4: Climax Rejection (Previous candle had extended upper wick, current breaks its low)
-        if len(candles) >= 2:
-          prev = candles[-2]
+        if len(act_candles) >= 2:
+          prev = act_candles[-2]
           prev_body = abs(prev["close"] - prev["open"])
           prev_upper_wick = prev["high"] - max(prev["open"], prev["close"])
           if (
               prev_body > 0
               and prev_upper_wick >= (UPPER_WICK_RATIO * prev_body)
-              and candle["low"] < prev["low"]
+              and act_candle["low"] < prev["low"]
           ):
-            broker.place_order(symbol, exchange, "SELL", qty, ltp)
+            broker.place_order(active_sym, exchange, "SELL", qty, ltp)
             exit_time = now_time.strftime("%H:%M:%S")
             print(
                 "\n>>> [STAGE 4 EXIT - CLIMAX WICK REJECTION] Broke prev low"
                 f" {prev['low']:.2f} | Sold @ {ltp:.2f} <<<"
             )
             log_v3_trade(
-                symbol,
-                entry_time,
-                exit_time,
-                entry_price,
-                ltp,
-                initial_sl_price,
-                highest_ltp,
-                qty,
-                "STAGE_4_CLIMAX",
-                "Climax Wick Rejection",
+                active_sym, entry_time, exit_time, entry_price, ltp,
+                initial_sl_price, highest_ltp, qty, "STAGE_4_CLIMAX", "Climax Wick Rejection"
             )
-            break
+            reset_trade_state()
+            continue
 
     # ==========================================
     # TICK-BY-TICK MILESTONES & HARD SL CHECKS
     # ==========================================
     if in_trade:
+      ltp = active_q["ltp"]
+      act_candles = state[active_sym]["candles"]
       if ltp > highest_ltp:
         highest_ltp = ltp
 
       gain_pct = (highest_ltp - entry_price) / entry_price
 
-      # Stage 1 (+25%): Move SL to Cost-to-Cost (Risk-Free)
-      if gain_pct >= STAGE1_TRIGGER_PCT and stage == "INITIAL_BASE_SL":
+      # Stage 1 (1:1.5 R:R): Move SL to Cost-to-Cost (Risk-Free)
+      if highest_ltp >= be_trigger_price and stage == "INITIAL_BASE_SL":
         current_sl = entry_price
         stage = "STAGE_1_BREAKEVEN"
         print(
-            "\n>>> [STAGE 1 (+25%)] SL modified to Cost-to-Cost:"
+            f"\n>>> [STAGE 1 (1:1.5 R:R HIT)] SL modified to Cost-to-Cost:"
             f" {current_sl:.2f} (100% Risk-Free) <<<\n"
         )
 
@@ -367,8 +406,8 @@ def run_v3_strategy():
       if gain_pct >= STAGE2_TRIGGER_PCT and stage == "STAGE_1_BREAKEVEN":
         floor_25 = round(entry_price * (1 + STAGE2_LOCK_PCT), 2)
         last_2_low = (
-            min(candles[-1]["low"], candles[-2]["low"])
-            if len(candles) >= 2
+            min(act_candles[-1]["low"], act_candles[-2]["low"])
+            if len(act_candles) >= 2
             else floor_25
         )
         current_sl = round(max(floor_25, last_2_low), 2)
@@ -380,66 +419,45 @@ def run_v3_strategy():
 
       # Stage 4 (2x Target Hit)
       if ltp >= target_2x:
-        broker.place_order(symbol, exchange, "SELL", qty, ltp)
+        broker.place_order(active_sym, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         print(
             "\n>>> [STAGE 4 EXIT - 2X TARGET HIT] Double target reached! Sold @"
             f" {ltp:.2f} <<<"
         )
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            initial_sl_price,
-            highest_ltp,
-            qty,
-            "STAGE_4_2X_TARGET",
-            "2x Target Hit (+100%)",
+            active_sym, entry_time, exit_time, entry_price, ltp,
+            initial_sl_price, highest_ltp, qty, "STAGE_4_2X_TARGET", "2x Target Hit (+100%)"
         )
-        break
+        reset_trade_state()
+        continue
 
       live_pnl = round((ltp - entry_price) * qty, 2)
       print(
-          f"[{stage}] LTP: {ltp:.2f} (+{((ltp-entry_price)/entry_price)*100:.1f}%)"
-          f" | SL: {current_sl:.2f} | 2x: {target_2x:.2f} | P&L: ₹{live_pnl}"
+          f"[{stage} | {active_sym}] LTP: {ltp:.2f}"
+          f" (+{((ltp-entry_price)/entry_price)*100:.1f}%) | SL: {current_sl:.2f}"
+          f" | 1.5R BE: {be_trigger_price:.2f} | P&L: ₹{live_pnl}"
       )
 
       # Hard Stop-Loss Hit
       if ltp <= current_sl:
-        broker.place_order(symbol, exchange, "SELL", qty, ltp)
+        broker.place_order(active_sym, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
-        print(f"\n>>> [HARD SL EXIT] Triggered @ {ltp:.2f} (SL: {current_sl:.2f}) <<<")
+        print(f"\n>>> [HARD SL EXIT] {active_sym} @ {ltp:.2f} (SL: {current_sl:.2f}) <<<")
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            initial_sl_price,
-            highest_ltp,
-            qty,
-            stage,
-            f"SL Hit ({stage})",
+            active_sym, entry_time, exit_time, entry_price, ltp,
+            initial_sl_price, highest_ltp, qty, stage, f"SL Hit ({stage})"
         )
-        break
+        reset_trade_state()
+        continue
 
       # EOD Square-Off
       if config.MODE == "OPENALGO" and now_time >= config.SQUARE_OFF_TIME:
-        broker.place_order(symbol, exchange, "SELL", qty, ltp)
+        broker.place_order(active_sym, exchange, "SELL", qty, ltp)
         exit_time = now_time.strftime("%H:%M:%S")
         log_v3_trade(
-            symbol,
-            entry_time,
-            exit_time,
-            entry_price,
-            ltp,
-            initial_sl_price,
-            highest_ltp,
-            qty,
-            stage,
-            "EOD Square-Off",
+            active_sym, entry_time, exit_time, entry_price, ltp,
+            initial_sl_price, highest_ltp, qty, stage, "EOD Square-Off"
         )
         break
 
