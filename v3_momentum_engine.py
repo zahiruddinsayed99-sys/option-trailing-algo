@@ -8,7 +8,7 @@ import config
 # ==========================================
 # V3 EMOTION-DISCIPLINE PROTOCOL PARAMETERS
 # ==========================================
-MAX_RISK_PCT = 0.20  # Max 15% risk: (Entry - Base Low) / Entry <= 0.15
+MAX_RISK_PCT = 0.13  # Max ~₹760 risk on ₹295 premium (stays under ₹800 daily cap)
 MAX_SPREAD_INDEX = 1.00  # Max Bid-Ask spread for SENSEX/NIFTY (₹)
 MAX_SPREAD_STOCK = 0.15  # Max Bid-Ask spread for Stock Options (₹)
 STAGE1_TRIGGER_PCT = 0.25  # +25% move -> Shift SL to Cost-to-Cost (Breakeven)
@@ -143,8 +143,9 @@ def run_v3_strategy():
   # 3-Minute OHLC History & Base State
   candles = []  # List of dicts: {'open', 'high', 'low', 'close'}
   current_ticks = []
+  candle_start_dt = datetime.datetime.now()
   ticks_per_candle = 5 if config.MODE == "SIMULATION" else 180
-  base_candles_needed = 4  # 4-6 candle horizontal base observation
+  base_candles_needed = 4
 
   base_high = 0.0
   base_low = float("inf")
@@ -183,9 +184,15 @@ def run_v3_strategy():
     current_ticks.append(ltp)
 
     # ==========================================
-    # 3-MINUTE CANDLE CLOSE PROCESSING
+    # 3-MINUTE CANDLE CLOSE PROCESSING (WALL-CLOCK)
     # ==========================================
-    if len(current_ticks) >= ticks_per_candle:
+    candle_ready = (
+        len(current_ticks) >= ticks_per_candle
+        if config.MODE == "SIMULATION"
+        else (now_dt - candle_start_dt).total_seconds() >= 180
+    )
+
+    if candle_ready and current_ticks:
       candle = {
           "open": current_ticks[0],
           "high": max(current_ticks),
@@ -194,26 +201,33 @@ def run_v3_strategy():
       }
       candles.append(candle)
       current_ticks = []
+      candle_start_dt = now_dt
       ema_9 = calculate_ema([c["close"] for c in candles], EMA_PERIOD)
 
-      # PHASE A: FREEZE HOUR / 4-CANDLE HORIZONTAL BASE
-      if len(candles) <= base_candles_needed:
+      # PHASE A: FREEZE HOUR BASE (Accumulates all 3m candles until 11:30 AM in live mode)
+      is_observing = (
+          len(candles) <= base_candles_needed
+          if config.MODE == "SIMULATION"
+          else (now_time < config.TRADING_START_TIME and not base_locked)
+      )
+
+      if is_observing:
         base_high = max(base_high, candle["high"])
         base_low = min(base_low, candle["low"])
         print(
-            f"[BASE CANDLE {len(candles)}/{base_candles_needed}] Close:"
-            f" {candle['close']:.2f} | Base Range: [{base_low:.2f} -"
-            f" {base_high:.2f}]"
+            f"[FREEZE BASE #{len(candles)}] Close: {candle['close']:.2f} | Base"
+            f" Range: [{base_low:.2f} - {base_high:.2f}]"
         )
-        if len(candles) == base_candles_needed:
-          base_locked = True
-          print(
-              f"\n>>> [BASE LOCKED] Breakout Trigger > {base_high:.2f} | Base"
-              f" Low SL: {base_low:.2f} <<<\n"
-          )
         continue
 
-      # PHASE B: BREAKOUT ENTRY & <15% RISK FILTER (Execution Window 11:30 - 13:30)
+      if not base_locked and len(candles) > 0:
+        base_locked = True
+        print(
+            f"\n>>> [11:30 BASE LOCKED] Breakout Trigger > {base_high:.2f} | Base"
+            f" Low SL: {base_low:.2f} <<<\n"
+        )
+
+      # PHASE B: BREAKOUT ENTRY & <13% RISK FILTER (Execution Window 11:30 - 13:30)
       if base_locked and not in_trade:
         in_exec_window = (
             True
@@ -429,3 +443,4 @@ def run_v3_strategy():
 
 if __name__ == "__main__":
   run_v3_strategy()
+EOF

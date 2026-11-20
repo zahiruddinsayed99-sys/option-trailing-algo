@@ -1,14 +1,18 @@
 import datetime
 
 # Execution Mode: "SIMULATION" (local test) ya "OPENALGO" (live feed + paper/live orders)
-MODE = "SIMULATION"
+MODE = "OPENALGO"
 
+# static ip 
+STATIC_IP = "103.248.74.138"
+API_KEY = "IME4L2EX0U-200"  # OpenAlgo API Key- App ID
+API_SECRET = "k7oGcI14njkc76e8"  # OpenAlgo - Secret ID 
 # OpenAlgo Settings
-OPENALGO_API_KEY = "AAPKI_OPENALGO_API_KEY"
+OPENALGO_API_KEY = "718db67be7199f4c7884bdfd30ee9c55c36a38b2e1964949c7c2e75eb5d958d7"
 OPENALGO_HOST = "http://127.0.0.1:5000"
 
 # Default Strike & Risk Parameters (Runtime par override kar sakte hain)
-SYMBOL = "SENSEX26N1982600CE" #"SENSEX26NOV80800PE"
+SYMBOL = "SENSEX26NOV2684100CE" #"SENSEX26NOV80800PE"
 EXCHANGE = "BFO"  # NFO (Nifty/BankNifty) ya BFO (Sensex)
 QTY = 20  # 1 Lot Sensex = 20, Nifty = 75
 
