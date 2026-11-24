@@ -1,88 +1,129 @@
-import random
 import time
-from openalgo import api
 import config
 
 
 class BrokerAdapter:
+  """Unified adapter supporting SIMULATION and OpenAlgo WebSocket + REST modes."""
 
   def __init__(self):
-    self.mode = config.MODE
-    self.sim_prices = {}
-    self.sim_tick_count = 0
+    self.mode = config.MODE.upper()
+    self.client = None
+    self.ws_connected = False
+    self.subscribed = set()
+    self.sim_step = 0
+    self.sim_prices = [
+        180.0, 182.0, 181.0, 184.0,  # Candle 1 (Observe)
+        185.0, 188.0, 186.0, 189.0,  # Candle 2 (Observe)
+        188.0, 190.0, 187.0, 189.5,  # Candle 3 (Observe)
+        189.0, 191.0, 188.5, 190.0,  # Candle 4 (Observe -> Base High ~ 191.0, Base Low ~ 180.0)
+        190.5, 192.0, 194.0, 196.5,  # Candle 5 (Breakout > 191.0 -> ENTRY @ ~196.5)
+        198.0, 205.0, 212.0, 218.0,  # Candle 6 (+10% -> Stage 1 Breakeven)
+        225.0, 245.0, 275.0, 300.0,  # Candle 7 (+52% -> Stage 2 +25% Profit Lock)
+        310.0, 330.0, 345.0, 340.0,  # Candle 8 (Trailing higher)
+        335.0, 315.0, 295.0, 285.0,  # Candle 9 (Pullback -> Trailing SL / 9 EMA Exit)
+    ]
 
     if self.mode == "OPENALGO":
+      from openalgo import api
+
       self.client = api(
           api_key=config.OPENALGO_API_KEY, host=config.OPENALGO_HOST
       )
-
-  def _execute_with_retry(self, func, *args, retries=3, delay=0.5, **kwargs):
-    last_err = None
-    for attempt in range(1, retries + 1):
       try:
-        return func(*args, **kwargs)
+        self.client.connect()
+        self.ws_connected = True
+        print("[BROKER] OpenAlgo WebSocket connected (Zero-429 real-time stream).")
       except Exception as e:
-        last_err = e
-        print(
-            f"\n[API WARNING] Attempt {attempt}/{retries} failed: {e}."
-            f" Retrying in {delay}s..."
-        )
-        time.sleep(delay)
-        delay *= 2
-    print(f"\n[API ERROR] All {retries} attempts failed: {last_err}")
-    return None
+        self.ws_connected = False
+        print(f"[BROKER WARNING] WebSocket connect fallback to REST: {e}")
+
+  def ensure_subscribed(self, symbol, exchange):
+    if not self.ws_connected or (symbol, exchange) in self.subscribed:
+      return
+    try:
+      self.client.subscribe_quote([{"symbol": symbol, "exchange": exchange}])
+      self.subscribed.add((symbol, exchange))
+      time.sleep(0.4)
+    except Exception:
+      pass
 
   def get_quote(self, symbol, exchange):
-    if self.mode == "OPENALGO":
+    if self.mode == "SIMULATION":
+      price = self.sim_prices[min(self.sim_step, len(self.sim_prices) - 1)]
+      self.sim_step += 1
+      return {
+          "ltp": price,
+          "bid": round(price - 0.15, 2),
+          "ask": round(price + 0.15, 2),
+          "spread": 0.30,
+      }
 
-      def _fetch():
-        quote = self.client.quotes(symbol=symbol, exchange=exchange)
+    # 1. Primary: Zero-REST OpenAlgo WebSocket cache
+    if self.ws_connected:
+      self.ensure_subscribed(symbol, exchange)
+      try:
+        ws_q = self.client.get_quotes(symbol=symbol, exchange=exchange)
+        data = ws_q.get("data", ws_q) if isinstance(ws_q, dict) else None
+        if isinstance(data, dict) and float(data.get("ltp", 0)) > 0:
+          ltp = float(data["ltp"])
+          bid = float(data.get("bid", ltp))
+          ask = float(data.get("ask", ltp))
+          spread = round(max(0.0, ask - bid), 2)
+          return {"ltp": ltp, "bid": bid, "ask": ask, "spread": spread}
+      except Exception:
+        pass
+
+    # 2. Fallback: Single REST quote check (no retry storms on 429)
+    try:
+      quote = self.client.quotes(symbol=symbol, exchange=exchange)
+      if isinstance(quote, dict) and quote.get("status") == "success" and "data" in quote:
         data = quote["data"]
         ltp = float(data["ltp"])
         bid = float(data.get("bid", ltp))
         ask = float(data.get("ask", ltp))
         spread = round(max(0.0, ask - bid), 2)
         return {"ltp": ltp, "bid": bid, "ask": ask, "spread": spread}
+    except Exception as e:
+      print(f"[QUOTE WARNING] {symbol}: {e}")
 
-      return self._execute_with_retry(_fetch)
+    return None
 
-    # SIMULATION MODE: Multi-strike realistic price simulation
-    if symbol not in self.sim_prices:
-      idx = len(self.sim_prices)
-      self.sim_prices[symbol] = round(290.0 - (idx * 45.0), 2)
+  def place_market_order(self, symbol, exchange, action, qty):
+    if self.mode == "SIMULATION":
+      q = self.get_quote(symbol, exchange)
+      fill = q["ask"] if action == "BUY" else q["bid"]
+      print(f"[SIM ORDER] {action} {qty} {symbol} @ {fill:.2f}")
+      return {"status": "success", "orderid": f"SIM-{int(time.time())}", "fill_price": fill}
 
-    self.sim_tick_count += 1
-    p = self.sim_prices[symbol]
-    if self.sim_tick_count <= 20:
-      p = round(p + random.uniform(-2.0, 2.2), 2)
-    elif self.sim_tick_count <= 80:
-      p = round(p + random.uniform(-1.0, 4.5), 2)
-    else:
-      p = round(p - random.uniform(0.5, 3.5), 2)
+    try:
+      resp = self.client.placeorder(
+          strategy="V3_Momentum_Engine",
+          symbol=symbol,
+          action=action,
+          exchange=exchange,
+          price_type="MARKET",
+          product="MIS",
+          quantity=str(qty),
+      )
+      q = self.get_quote(symbol, exchange)
+      fill_est = (q["ask"] if action == "BUY" else q["bid"]) if q else 0.0
+      print(f"[OPENALGO ORDER] {action} {qty} {symbol} -> {resp}")
+      return {
+          "status": "success",
+          "orderid": resp.get("orderid", "UNKNOWN"),
+          "fill_price": fill_est,
+      }
+    except Exception as e:
+      print(f"[ORDER ERROR] {action} {symbol} failed: {e}")
+      return None
 
-    p = max(15.0, p)
-    self.sim_prices[symbol] = p
-    return {"ltp": p, "bid": round(p - 0.25, 2), "ask": round(p + 0.25, 2), "spread": 0.50}
-
-  def get_ltp(self, symbol, exchange):
-    q = self.get_quote(symbol, exchange)
-    return q["ltp"] if q else None
-
-  def place_order(self, symbol, exchange, action, qty, price):
-    if self.mode == "OPENALGO":
-
-      def _order():
-        return self.client.placeorder(
-            strategy="Intraday_Option_Trail",
-            symbol=symbol,
-            action=action,
-            exchange=exchange,
-            price_type="MARKET",
-            product="MIS",
-            quantity=qty,
-        )
-
-      return self._execute_with_retry(_order)
-
-    print(f"\n[SIM ORDER] {action} {qty} qty of {symbol} @ ₹{price:.2f}")
-    return {"status": "success", "mode": "SIMULATION"}
+  def shutdown(self):
+    if self.ws_connected and self.client:
+      try:
+        if self.subscribed:
+          self.client.unsubscribe_quote(
+              [{"symbol": s, "exchange": e} for s, e in self.subscribed]
+          )
+        self.client.disconnect()
+      except Exception:
+        pass
