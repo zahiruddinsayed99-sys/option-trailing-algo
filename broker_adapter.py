@@ -1,3 +1,4 @@
+import datetime
 import time
 import config
 
@@ -17,9 +18,9 @@ class BrokerAdapter:
         188.0, 190.0, 187.0, 189.5,  # Candle 3 (Observe)
         189.0, 191.0, 188.5, 190.0,  # Candle 4 (Observe -> Base High ~ 191.0, Base Low ~ 180.0)
         190.5, 192.0, 194.0, 196.5,  # Candle 5 (Breakout > 191.0 -> ENTRY @ ~196.5)
-        198.0, 205.0, 212.0, 218.0,  # Candle 6 (+10% -> Stage 1 Breakeven)
-        225.0, 245.0, 275.0, 300.0,  # Candle 7 (+52% -> Stage 2 +25% Profit Lock)
-        310.0, 330.0, 345.0, 340.0,  # Candle 8 (Trailing higher)
+        198.0, 205.0, 212.0, 222.0,  # Candle 6 (+1.5R Breakeven)
+        235.0, 250.0, 265.0, 280.0,  # Candle 7 (+2.5R -> +1R Profit Lock)
+        295.0, 315.0, 335.0, 340.0,  # Candle 8 (+50% Surge -> Stage 2 Trail)
         335.0, 315.0, 295.0, 285.0,  # Candle 9 (Pullback -> Trailing SL / 9 EMA Exit)
     ]
 
@@ -43,7 +44,7 @@ class BrokerAdapter:
     try:
       self.client.subscribe_quote([{"symbol": symbol, "exchange": exchange}])
       self.subscribed.add((symbol, exchange))
-      time.sleep(0.4)
+      time.sleep(0.8)  # Allow initial WebSocket snapshot to populate
     except Exception:
       pass
 
@@ -88,6 +89,62 @@ class BrokerAdapter:
 
     return None
 
+  def fetch_freeze_hour_base(self, symbol, exchange):
+    """Backfills 10:30-11:30 AM 3m candles if OTM rotation switches into a new strike mid-session."""
+    if self.mode == "SIMULATION" or not self.client:
+      return None, None, []
+    try:
+      today_str = datetime.date.today().strftime("%Y-%m-%d")
+      hist = self.client.history(
+          symbol=symbol,
+          exchange=exchange,
+          interval="3m",
+          start_date=today_str,
+          end_date=today_str,
+      )
+      rows = hist.get("data", []) if isinstance(hist, dict) else []
+      candles = []
+      base_high = None
+      base_low = None
+      for r in rows:
+        ts_str = str(r.get("timestamp", r.get("datetime", "")))
+        h = float(r.get("high", 0))
+        l = float(r.get("low", 0))
+        o = float(r.get("open", 0))
+        c = float(r.get("close", 0))
+        if h <= 0 or l <= 0:
+          continue
+        candles.append({"open": o, "high": h, "low": l, "close": c})
+        if "10:3" in ts_str or "10:4" in ts_str or "10:5" in ts_str or "11:0" in ts_str or "11:1" in ts_str or "11:2" in ts_str:
+          base_high = h if base_high is None else max(base_high, h)
+          base_low = l if base_low is None else min(base_low, l)
+      return base_high, base_low, candles[-20:]
+    except Exception:
+      return None, None, []
+
+  def _fetch_executed_price(self, orderid):
+    """Queries OpenAlgo orderbook once to retrieve exact executed average_price."""
+    if not orderid or orderid == "UNKNOWN" or not self.client:
+      return 0.0
+    try:
+      time.sleep(0.35)
+      ob = self.client.orderbook()
+      orders = []
+      if isinstance(ob, dict):
+        data = ob.get("data", {})
+        if isinstance(data, dict):
+          orders = data.get("orders", [])
+        elif isinstance(data, list):
+          orders = data
+      for o in orders:
+        if str(o.get("orderid", "")) == str(orderid):
+          avg_px = float(o.get("average_price", o.get("price", 0)) or 0)
+          if avg_px > 0:
+            return avg_px
+    except Exception:
+      pass
+    return 0.0
+
   def place_market_order(self, symbol, exchange, action, qty):
     if self.mode == "SIMULATION":
       q = self.get_quote(symbol, exchange)
@@ -105,13 +162,16 @@ class BrokerAdapter:
           product="MIS",
           quantity=str(qty),
       )
-      q = self.get_quote(symbol, exchange)
-      fill_est = (q["ask"] if action == "BUY" else q["bid"]) if q else 0.0
-      print(f"[OPENALGO ORDER] {action} {qty} {symbol} -> {resp}")
+      orderid = resp.get("orderid", "UNKNOWN") if isinstance(resp, dict) else "UNKNOWN"
+      fill_exact = self._fetch_executed_price(orderid)
+      if fill_exact <= 0:
+        q = self.get_quote(symbol, exchange)
+        fill_exact = (q["ask"] if action == "BUY" else q["bid"]) if q else 0.0
+      print(f"[OPENALGO ORDER] {action} {qty} {symbol} @ ₹{fill_exact:.2f} -> {resp}")
       return {
           "status": "success",
-          "orderid": resp.get("orderid", "UNKNOWN"),
-          "fill_price": fill_est,
+          "orderid": orderid,
+          "fill_price": fill_exact,
       }
     except Exception as e:
       print(f"[ORDER ERROR] {action} {symbol} failed: {e}")

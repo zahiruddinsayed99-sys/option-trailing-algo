@@ -54,6 +54,23 @@ def current_candle_bucket():
   return (now.hour * 3600 + now.minute * 60 + now.second) // CANDLE_SEC
 
 
+def sync_strike_history(broker, state, sym, exchange):
+  """Hydrates Freeze-Hour (10:30-11:30 AM) base_high/base_low on OTM rotation."""
+  st = state[sym]
+  if st["base_high"] is not None:
+    return
+  bh, bl, hist_candles = broker.fetch_freeze_hour_base(sym, exchange)
+  if bh is not None and bl is not None:
+    st["base_high"] = bh
+    st["base_low"] = bl
+    if hist_candles:
+      st["candles"] = hist_candles
+    print(
+        f"[BASE SYNCED | {sym}] Hydrated Freeze-Hour Base from history:"
+        f" [{bl:.2f} - {bh:.2f}] ({len(hist_candles)} candles)"
+    )
+
+
 def run_v3_engine():
   init_csv()
   broker = BrokerAdapter()
@@ -61,7 +78,7 @@ def run_v3_engine():
   default_list = getattr(config, "CANDIDATE_STRIKES", [config.SYMBOL])
   default_str = ",".join(default_list)
 
-  print("\n=== V3.2 MULTI-STRIKE MOMENTUM ENGINE SETUP ===")
+  print("\n=== V3.3 MULTI-STRIKE MOMENTUM ENGINE SETUP ===")
   sym_in = input(f"Candidate Strikes [{default_str}]: ").strip().upper()
   strikes = [s.strip() for s in sym_in.split(",") if s.strip()] if sym_in else default_list
 
@@ -99,11 +116,13 @@ def run_v3_engine():
 
   active_idx = 0
   active_sym = strikes[active_idx]
+  started_late = datetime.datetime.now().time() >= datetime.time(11, 18)
 
   in_trade = False
   entry_price = 0.0
   initial_risk_pts = 0.0
   breakeven_trigger = 0.0
+  profit_lock_trigger = 0.0
   highest_price = 0.0
   stop_loss = 0.0
   stage = "IDLE"
@@ -119,7 +138,7 @@ def run_v3_engine():
   sim_ticks_in_bucket = 0
 
   print(
-      f"\n>>> Starting V3.2 Engine [{config.MODE}] | {len(strikes)} Strikes Watched"
+      f"\n>>> Starting V3.3 Engine [{config.MODE}] | {len(strikes)} Strikes Watched"
       f" | Band (₹{min_cap:.0f}-₹{max_cap:.0f}/lot): ₹{min_prem:.2f}-₹{max_prem:.2f}"
       f" | Max SL: {max_sl_points:.2f} pts | Trades: {trades_today}/{max_trades} <<<"
   )
@@ -222,6 +241,7 @@ def run_v3_engine():
               )
               active_idx = next_i
               active_sym = cand_s
+              sync_strike_history(broker, state, active_sym, exchange)
               break
         elif curr_ltp < min_prem and active_idx - 1 >= 0:
           for prev_i in range(active_idx - 1, -1, -1):
@@ -240,9 +260,10 @@ def run_v3_engine():
               )
               active_idx = prev_i
               active_sym = cand_s
+              sync_strike_history(broker, state, active_sym, exchange)
               break
 
-      # 5. Intra-Candle Tick Exit Management (Instant SL / BE / 2x Target / EOD)
+      # 5. Intra-Candle Tick Exit Management (Instant SL / 1.5R BE / 2.5R +1R Lock / +50% Trail / 2x Target / EOD)
       if in_trade and state[active_sym]["last_quote"]:
         ltp = state[active_sym]["last_quote"]["ltp"]
         if ltp > highest_price:
@@ -255,6 +276,16 @@ def run_v3_engine():
           print(
               f"\n[STAGE 1: 1.5R BREAKEVEN] {active_sym} hit ₹{ltp:.2f} (>= ₹{breakeven_trigger:.2f})."
               f" SL locked at Cost: ₹{stop_loss:.2f}"
+          )
+
+        # Stage 1.5: 1:2.5 Risk-Reward -> Lock +1R Guaranteed Profit Floor
+        if stage in ("INITIAL_BASE_SL", "STAGE1_1.5R_BREAKEVEN") and ltp >= profit_lock_trigger:
+          one_r_floor = round(entry_price + initial_risk_pts, 2)
+          stop_loss = max(stop_loss, one_r_floor)
+          stage = "STAGE1.5_2.5R_LOCK_1R"
+          print(
+              f"\n[STAGE 1.5: 2.5R PROFIT LOCK] {active_sym} hit ₹{ltp:.2f} (>= ₹{profit_lock_trigger:.2f})."
+              f" SL locked at +1R: ₹{stop_loss:.2f}"
           )
 
         # Stage 2: +50% Profit Surge -> Lock +25% Floor
@@ -338,8 +369,13 @@ def run_v3_engine():
         closes = [c["close"] for c in st["candles"]]
         ema9 = compute_ema(closes, period=9)
 
-        # PHASE A: Freeze Hour / Base Observation (before 11:30 AM or < 4 warmup candles)
-        if now_t < window_start or len(st["candles"]) <= MIN_OBSERVE_CANDLES:
+        need_warmup = (
+            st["base_high"] is None
+            or (started_late and len(st["candles"]) <= MIN_OBSERVE_CANDLES)
+        )
+
+        # PHASE A: Freeze Hour / Base Observation (before 11:30 AM or late-start warmup)
+        if now_t < window_start or need_warmup:
           st["base_high"] = (
               c_high if st["base_high"] is None else max(st["base_high"], c_high)
           )
@@ -395,11 +431,12 @@ def run_v3_engine():
 
                 initial_risk_pts = round(entry_price - stop_loss, 2)
                 breakeven_trigger = round(entry_price + (1.5 * initial_risk_pts), 2)
+                profit_lock_trigger = round(entry_price + (2.5 * initial_risk_pts), 2)
                 stage = "INITIAL_BASE_SL"
                 print(
                     f"\n>>> [ENTRY TRIGGERED] BUY {qty} {active_sym} @ ₹{entry_price:.2f}"
                     f" | SL: ₹{stop_loss:.2f} (Risk: {initial_risk_pts:.2f} pts / ₹{initial_risk_pts*qty:.0f})"
-                    f" | 1.5R BE Target: ₹{breakeven_trigger:.2f} <<<"
+                    f" | 1.5R BE: ₹{breakeven_trigger:.2f} | 2.5R +1R Lock: ₹{profit_lock_trigger:.2f} <<<"
                 )
 
         # PHASE C: Candle-Close Trailing & Momentum Exit

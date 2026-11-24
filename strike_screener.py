@@ -18,7 +18,7 @@ def parse_expiry(exp_str):
 
 
 def screen_strikes():
-  print("\n=== V3.2 INSTANT PRE-MARKET STRIKE SCREENER ===")
+  print("\n=== V3.3 INSTANT PRE-MARKET STRIKE SCREENER ===")
   idx_in = input("Index [SENSEX / NIFTY] (default SENSEX): ").strip().upper() or "SENSEX"
   opt_in = input("Direction [CE / PE] (default PE): ").strip().upper() or "PE"
   spot_str = input("Current Spot Level (e.g., 83300 for SENSEX, 24150 for NIFTY): ").strip()
@@ -66,8 +66,19 @@ def screen_strikes():
     print("[ERROR] No active/upcoming expiries found.")
     return
 
-  nearest_exp = min(r[0] for r in valid_rows)
-  expiry_contracts = [r for r in valid_rows if r[0] == nearest_exp]
+  distinct_expiries = sorted(set(r[0] for r in valid_rows))
+  selected_exp = distinct_expiries[0]
+
+  # 0-DTE Expiry-Day Gamma/Theta Guardrail
+  if selected_exp == today and len(distinct_expiries) > 1:
+    next_exp = distinct_expiries[1]
+    print(f"\n[0-DTE EXPIRY WARNING] Nearest expiry ({selected_exp}) is TODAY!")
+    print("  0-DTE contracts carry extreme gamma/theta spikes against a fixed ₹500 SL.")
+    choice = input(f"  Switch to Next-Week Expiry ({next_exp})? [Y/n]: ").strip().lower()
+    if choice != "n":
+      selected_exp = next_exp
+
+  expiry_contracts = [r for r in valid_rows if r[0] == selected_exp]
   exp_str = expiry_contracts[0][1]
 
   # Pick 10 strikes starting near ATM into OTM
