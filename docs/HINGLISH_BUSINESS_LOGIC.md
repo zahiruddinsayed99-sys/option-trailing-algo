@@ -1,7 +1,3 @@
-Yahan dono engines (**Options Momentum Engine V3.4** aur **NSE Cash Equity Intraday Engine V1.0**) ki **Business & Trading Logic** simple, beginner-friendly Hinglish mein samjhayi gayi hai — taaki aapko clear pata ho ki aapka system _kyun_ aur _kaise_ paisa banata hai aur loss ko kaise rokta hai.
-
----
-
 ### Core Philosophy: Dono Engines Ek Hi Formula Par Kaam Karte Hain
 
 Retail traders ka sabse bada nuksan **morning noise (09:15–10:30 AM)** mein jaldi entry lene aur **bade losses ko hold karne** se hota hai. Aapke dono engines is problem ko 3 rules se solve karte hain:
