@@ -18,7 +18,7 @@ def parse_expiry(exp_str):
 
 
 def screen_strikes():
-  print("\n=== V3.3 INSTANT PRE-MARKET STRIKE SCREENER ===")
+  print("\n=== V3.4 INSTANT PRE-MARKET STRIKE SCREENER ===")
   idx_in = input("Index [SENSEX / NIFTY] (default SENSEX): ").strip().upper() or "SENSEX"
   opt_in = input("Direction [CE / PE] (default PE): ").strip().upper() or "PE"
   spot_str = input("Current Spot Level (e.g., 83300 for SENSEX, 24150 for NIFTY): ").strip()
@@ -38,7 +38,8 @@ def screen_strikes():
     return
 
   t0 = time.time()
-  conn = sqlite3.connect(OPENALGO_DB)
+  # Read-only URI mode prevents SQLite lock contention with live OpenAlgo server
+  conn = sqlite3.connect(f"file:{OPENALGO_DB}?mode=ro", uri=True)
   cur = conn.cursor()
   cur.execute(
       """
@@ -55,11 +56,15 @@ def screen_strikes():
     print(f"[ERROR] No {idx_in} {opt_in} contracts found in OpenAlgo master DB.")
     return
 
-  today = datetime.date.today()
+  now = datetime.datetime.now()
+  today = now.date()
+  # If run after 15:30 IST, exclude today's expired contracts
+  min_valid_date = today + datetime.timedelta(days=1) if now.time() >= datetime.time(15, 30) else today
+
   valid_rows = []
   for sym, exp_str, strike, lotsize in rows:
     exp_dt = parse_expiry(exp_str)
-    if exp_dt and exp_dt >= today:
+    if exp_dt and exp_dt >= min_valid_date:
       valid_rows.append((exp_dt, exp_str, sym, float(strike), int(lotsize)))
 
   if not valid_rows:
@@ -73,7 +78,7 @@ def screen_strikes():
   if selected_exp == today and len(distinct_expiries) > 1:
     next_exp = distinct_expiries[1]
     print(f"\n[0-DTE EXPIRY WARNING] Nearest expiry ({selected_exp}) is TODAY!")
-    print("  0-DTE contracts carry extreme gamma/theta spikes against a fixed ₹500 SL.")
+    print("  On 0-DTE, ₹4K-₹5K/lot forces Deep ITM strikes with wide spreads & extreme gamma.")
     choice = input(f"  Switch to Next-Week Expiry ({next_exp})? [Y/n]: ").strip().lower()
     if choice != "n":
       selected_exp = next_exp
@@ -81,11 +86,12 @@ def screen_strikes():
   expiry_contracts = [r for r in valid_rows if r[0] == selected_exp]
   exp_str = expiry_contracts[0][1]
 
-  # Pick 10 strikes starting near ATM into OTM
+  # Index-aware ATM offset (200 pts SENSEX vs 100 pts NIFTY)
+  offset = 200 if idx_in == "SENSEX" else 100
   if opt_in == "CE":
-    otm = sorted([r for r in expiry_contracts if r[3] >= spot - 100], key=lambda x: x[3])[:10]
+    otm = sorted([r for r in expiry_contracts if r[3] >= spot - offset], key=lambda x: x[3])[:10]
   else:
-    otm = sorted([r for r in expiry_contracts if r[3] <= spot + 100], key=lambda x: x[3], reverse=True)[:10]
+    otm = sorted([r for r in expiry_contracts if r[3] <= spot + offset], key=lambda x: x[3], reverse=True)[:10]
 
   lot_size = otm[0][4] if otm else lot_preview
   min_prem = round(min_cap / lot_size, 2)
@@ -111,12 +117,15 @@ def screen_strikes():
       if isinstance(q, dict) and q.get("status") == "success" and "data" in q:
         d = q["data"]
         ltp = float(d["ltp"])
-        bid = float(d.get("bid", ltp))
-        ask = float(d.get("ask", ltp))
-        spread = round(max(0.0, ask - bid), 2)
+        raw_bid = float(d.get("bid", 0) or 0)
+        raw_ask = float(d.get("ask", 0) or 0)
+        valid_depth = raw_bid > 0 and raw_ask > 0 and raw_ask >= raw_bid
+        spread = round(raw_ask - raw_bid, 2) if valid_depth else 999.0
         cap_req = round(ltp * lot_size, 0)
 
-        if min_prem <= ltp <= max_prem and spread <= 1.00:
+        if not valid_depth:
+          status = "NO DEPTH"
+        elif min_prem <= ltp <= max_prem and spread <= 1.00:
           status = "SWEET SPOT"
           sweet_spot.append(sym)
         elif ltp > max_prem:
@@ -126,8 +135,9 @@ def screen_strikes():
         else:
           status = "WIDE SPREAD"
 
+        spread_disp = f"₹{spread:<6.2f}" if valid_depth else "N/A    "
         print(
-            f"{sym:<24} | {strike:<8.0f} | ₹{ltp:<7.2f} | ₹{cap_req:<10.0f} | ₹{spread:<6.2f} | {status}",
+            f"{sym:<24} | {strike:<8.0f} | ₹{ltp:<7.2f} | ₹{cap_req:<10.0f} | {spread_disp} | {status}",
             flush=True,
         )
     except Exception as e:
@@ -140,7 +150,7 @@ def screen_strikes():
   else:
     print(
         f"[NOTE] No strikes fell inside ₹{min_prem:.2f}–₹{max_prem:.2f}"
-        f" (₹{min_cap:.0f}-₹{max_cap:.0f}/lot) with <= ₹1.00 spread (or market closed)."
+        f" (₹{min_cap:.0f}-₹{max_cap:.0f}/lot) with valid depth & <= ₹1.00 spread."
     )
   print("=" * 82 + "\n")
 

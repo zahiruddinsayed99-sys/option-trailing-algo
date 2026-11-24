@@ -1,4 +1,5 @@
 import datetime
+import threading
 import time
 import config
 
@@ -11,6 +12,7 @@ class BrokerAdapter:
     self.client = None
     self.ws_connected = False
     self.subscribed = set()
+    self._sub_lock = threading.Lock()
     self.sim_step = 0
     self.sim_prices = [
         180.0, 182.0, 181.0, 184.0,  # Candle 1 (Observe)
@@ -36,27 +38,56 @@ class BrokerAdapter:
         print("[BROKER] OpenAlgo WebSocket connected (Zero-429 real-time stream).")
       except Exception as e:
         self.ws_connected = False
-        print(f"[BROKER WARNING] WebSocket connect fallback to REST: {e}")
+        print(f"[BROKER WARNING:] WebSocket connect fallback to REST: {e}")
 
   def ensure_subscribed(self, symbol, exchange):
-    if not self.ws_connected or (symbol, exchange) in self.subscribed:
+    if not self.ws_connected:
       return
-    try:
-      self.client.subscribe_quote([{"symbol": symbol, "exchange": exchange}])
-      self.subscribed.add((symbol, exchange))
-      time.sleep(0.8)  # Allow initial WebSocket snapshot to populate
-    except Exception:
-      pass
+    with self._sub_lock:
+      if (symbol, exchange) in self.subscribed:
+        return
+      try:
+        self.client.subscribe_quote([{"symbol": symbol, "exchange": exchange}])
+        self.subscribed.add((symbol, exchange))
+        time.sleep(0.8)  # Allow initial WebSocket snapshot to populate
+      except Exception:
+        pass
 
-  def get_quote(self, symbol, exchange):
+  @staticmethod
+  def _parse_depth_payload(data):
+    """Strict depth parser: prevents false ₹0.00 spread when broker sends bid=0/ask=0."""
+    ltp = float(data["ltp"])
+    raw_bid = float(data.get("bid", 0) or 0)
+    raw_ask = float(data.get("ask", 0) or 0)
+    valid_depth = raw_bid > 0 and raw_ask > 0 and raw_ask >= raw_bid
+    if valid_depth:
+      bid = raw_bid
+      ask = raw_ask
+      spread = round(ask - bid, 2)
+    else:
+      bid = round(ltp - 0.50, 2)
+      ask = round(ltp + 0.50, 2)
+      spread = 999.0  # Reject illiquid/missing-depth entries safely
+    return {
+        "ltp": ltp,
+        "bid": bid,
+        "ask": ask,
+        "spread": spread,
+        "valid_depth": valid_depth,
+    }
+
+  def get_quote(self, symbol, exchange, advance_sim=True):
     if self.mode == "SIMULATION":
-      price = self.sim_prices[min(self.sim_step, len(self.sim_prices) - 1)]
-      self.sim_step += 1
+      idx = min(self.sim_step, len(self.sim_prices) - 1)
+      price = self.sim_prices[idx]
+      if advance_sim:
+        self.sim_step += 1
       return {
           "ltp": price,
           "bid": round(price - 0.15, 2),
           "ask": round(price + 0.15, 2),
           "spread": 0.30,
+          "valid_depth": True,
       }
 
     # 1. Primary: Zero-REST OpenAlgo WebSocket cache
@@ -65,12 +96,8 @@ class BrokerAdapter:
       try:
         ws_q = self.client.get_quotes(symbol=symbol, exchange=exchange)
         data = ws_q.get("data", ws_q) if isinstance(ws_q, dict) else None
-        if isinstance(data, dict) and float(data.get("ltp", 0)) > 0:
-          ltp = float(data["ltp"])
-          bid = float(data.get("bid", ltp))
-          ask = float(data.get("ask", ltp))
-          spread = round(max(0.0, ask - bid), 2)
-          return {"ltp": ltp, "bid": bid, "ask": ask, "spread": spread}
+        if isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
+          return self._parse_depth_payload(data)
       except Exception:
         pass
 
@@ -79,11 +106,8 @@ class BrokerAdapter:
       quote = self.client.quotes(symbol=symbol, exchange=exchange)
       if isinstance(quote, dict) and quote.get("status") == "success" and "data" in quote:
         data = quote["data"]
-        ltp = float(data["ltp"])
-        bid = float(data.get("bid", ltp))
-        ask = float(data.get("ask", ltp))
-        spread = round(max(0.0, ask - bid), 2)
-        return {"ltp": ltp, "bid": bid, "ask": ask, "spread": spread}
+        if float(data.get("ltp", 0) or 0) > 0:
+          return self._parse_depth_payload(data)
     except Exception as e:
       print(f"[QUOTE WARNING] {symbol}: {e}")
 
@@ -108,14 +132,14 @@ class BrokerAdapter:
       base_low = None
       for r in rows:
         ts_str = str(r.get("timestamp", r.get("datetime", "")))
-        h = float(r.get("high", 0))
-        l = float(r.get("low", 0))
-        o = float(r.get("open", 0))
-        c = float(r.get("close", 0))
+        h = float(r.get("high", 0) or 0)
+        l = float(r.get("low", 0) or 0)
+        o = float(r.get("open", 0) or 0)
+        c = float(r.get("close", 0) or 0)
         if h <= 0 or l <= 0:
           continue
         candles.append({"open": o, "high": h, "low": l, "close": c})
-        if "10:3" in ts_str or "10:4" in ts_str or "10:5" in ts_str or "11:0" in ts_str or "11:1" in ts_str or "11:2" in ts_str:
+        if any(tag in ts_str for tag in ("10:3", "10:4", "10:5", "11:0", "11:1", "11:2")):
           base_high = h if base_high is None else max(base_high, h)
           base_low = l if base_low is None else min(base_low, l)
       return base_high, base_low, candles[-20:]
@@ -147,7 +171,7 @@ class BrokerAdapter:
 
   def place_market_order(self, symbol, exchange, action, qty):
     if self.mode == "SIMULATION":
-      q = self.get_quote(symbol, exchange)
+      q = self.get_quote(symbol, exchange, advance_sim=False)
       fill = q["ask"] if action == "BUY" else q["bid"]
       print(f"[SIM ORDER] {action} {qty} {symbol} @ {fill:.2f}")
       return {"status": "success", "orderid": f"SIM-{int(time.time())}", "fill_price": fill}
@@ -162,7 +186,10 @@ class BrokerAdapter:
           product="MIS",
           quantity=str(qty),
       )
-      orderid = resp.get("orderid", "UNKNOWN") if isinstance(resp, dict) else "UNKNOWN"
+      if not isinstance(resp, dict) or resp.get("status") != "success":
+        print(f"[ORDER REJECTED] {action} {qty} {symbol} -> {resp}")
+        return None
+      orderid = resp.get("orderid", "UNKNOWN")
       fill_exact = self._fetch_executed_price(orderid)
       if fill_exact <= 0:
         q = self.get_quote(symbol, exchange)
@@ -180,10 +207,11 @@ class BrokerAdapter:
   def shutdown(self):
     if self.ws_connected and self.client:
       try:
-        if self.subscribed:
-          self.client.unsubscribe_quote(
-              [{"symbol": s, "exchange": e} for s, e in self.subscribed]
-          )
+        with self._sub_lock:
+          if self.subscribed:
+            self.client.unsubscribe_quote(
+                [{"symbol": s, "exchange": e} for s, e in self.subscribed]
+            )
         self.client.disconnect()
       except Exception:
-        pass
+        pass 

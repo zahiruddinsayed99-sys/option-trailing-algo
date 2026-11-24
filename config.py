@@ -1,11 +1,16 @@
+import os
+
 # --- EXECUTION MODE ---
 # "SIMULATION" = Local dry-run with synthetic ticks (0 API calls)
 # "OPENALGO"   = Live/Paper routing via local OpenAlgo server (Analyze Mode)
-MODE = "OPENALGO"
+MODE = os.getenv("OPENALGO_MODE", "OPENALGO")
 
 # --- OPENALGO LOCAL GATEWAY ---
-OPENALGO_HOST = "http://127.0.0.1:5000"
-OPENALGO_API_KEY = "YOUR_OPENALGO_API_KEY_HERE"
+OPENALGO_HOST = os.getenv("OPENALGO_HOST", "http://127.0.0.1:5000")
+try:
+  from config_local import OPENALGO_API_KEY
+except ImportError:
+  OPENALGO_API_KEY = os.getenv("OPENALGO_API_KEY", "YOUR_OPENALGO_API_KEY_HERE")
 
 # --- DEFAULT CONTRACT & MULTI-STRIKE WATCHLIST ---
 EXCHANGE = "BFO"
@@ -25,9 +30,13 @@ MAX_TRADES_PER_DAY = 3
 MAX_DAILY_LOSS = -800.0
 ESTIMATED_CHARGES_PER_TRADE = 55.0
 
-# --- V3.2 CAPITAL-NORMALIZED POSITION SIZING (₹4,000 - ₹5,000 per lot) ---
-# Automatically derives index-agnostic premium thresholds:
-#   SENSEX (20 qty) -> ₹200.00 - ₹250.00
-#   NIFTY  (65 qty) -> ₹61.55  - ₹76.90
-MIN_CAPITAL_PER_LOT = 4000.0
-MAX_CAPITAL_PER_LOT = 5000.0
+# --- V3.4 CAPITAL-NORMALIZED POSITION SIZING ---
+# Standard Non-Expiry Days: ₹4,000 - ₹5,000 per lot (SENSEX: ₹200-₹250 | NIFTY: ₹61.55-₹76.90)
+# Expiry Days (0-DTE): ₹1,500 - ₹2,500 per lot if trading 0-DTE, or switch to Next-Week Expiry
+IS_EXPIRY_DAY = os.getenv("IS_EXPIRY_DAY", "FALSE").upper() == "TRUE"
+if IS_EXPIRY_DAY:
+  MIN_CAPITAL_PER_LOT = 1500.0
+  MAX_CAPITAL_PER_LOT = 2500.0
+else:
+  MIN_CAPITAL_PER_LOT = 4000.0
+  MAX_CAPITAL_PER_LOT = 5000.0
