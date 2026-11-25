@@ -1,4 +1,7 @@
 import datetime
+import json
+import time
+import urllib.request
 import broker_adapter
 import config
 
@@ -37,6 +40,17 @@ SENSEX_30_BASE_VOL = {
 }
 
 
+def _extract_prev_close(q: dict) -> float:
+    """Safely extracts prior close across OpenAlgo/Fyers field variations."""
+    return float(
+        q.get("prev_close")
+        or q.get("prevclose")
+        or q.get("close")
+        or q.get("open")
+        or 0
+    )
+
+
 def _compute_rvol(symbol: str, volume: float) -> float:
     """Computes time-of-day normalized Relative Volume (RVOL)."""
     now = datetime.datetime.now()
@@ -55,46 +69,68 @@ def _compute_rvol(symbol: str, volume: float) -> float:
     return 1.0
 
 
-def _extract_prev_close(q: dict) -> float:
-    """Extracts previous close across OpenAlgo payload key variants, falling back to open."""
-    return float(
-        q.get("prev_close")
-        or q.get("prevclose")
-        or q.get("close")
-        or q.get("open")
-        or 0
-    )
-
-
 def _fetch_sensex30_quotes(broker, symbols: list[str], exchange: str) -> dict:
-    """Fetches and normalizes OpenAlgo multiquotes response {'results': [{'symbol': ..., 'data': {...}}]}."""
+    """Fetches Sensex-30 quotes via WebSocket cache first, then chunked multiquotes REST fallback."""
+    if getattr(broker, "mode", "") != "OPENALGO":
+        try:
+            fallback = broker.get_multiquotes(symbols, exchange)
+            return fallback if isinstance(fallback, dict) else {}
+        except Exception as e:
+            print(f"[SCREENER WARN] Simulation multiquotes failed: {e}")
+            return {}
+
     quotes_map = {}
 
-    if getattr(broker, "mode", "") == "OPENALGO" and getattr(broker, "client", None) is not None:
-        try:
-            payload = [{"symbol": s, "exchange": exchange} for s in symbols]
-            res = broker.client.multiquotes(symbols=payload)
-            if isinstance(res, dict) and res.get("status") == "success":
-                for item in (res.get("results") or []):
-                    if not isinstance(item, dict):
-                        continue
-                    sym = item.get("symbol")
-                    data = item.get("data") or {}
-                    if sym and isinstance(data, dict):
-                        quotes_map[sym] = data
-            if quotes_map:
-                return quotes_map
-        except Exception as e:
-            print(f"[SCREENER WARNING] Direct multiquotes failed, falling back to adapter: {e}")
+    # 1. Fast WebSocket cache check (2.0s warm-up)
+    if getattr(broker, "ws_connected", False):
+        for sym in symbols:
+            broker.ensure_subscribed(sym, exchange)
+        time.sleep(2.0)
+        for sym in symbols:
+            try:
+                ws_q = broker.client.get_quotes(symbol=sym, exchange=exchange)
+                data = ws_q.get("data", ws_q) if isinstance(ws_q, dict) else None
+                if isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
+                    quotes_map[sym] = data
+            except Exception:
+                pass
 
-    # Fallback for SIMULATION mode or custom adapter mapping
-    try:
-        fallback = broker.get_multiquotes(symbols, exchange)
-        if isinstance(fallback, dict):
-            return fallback
-    except Exception as e:
-        print(f"[SCREENER WARNING] Fallback multiquotes failed: {e}")
-    return {}
+    missing = [s for s in symbols if s not in quotes_map]
+    if not missing:
+        return quotes_map
+
+    # 2. Chunked REST multiquotes fallback for any missing symbols (15 per batch, 15s timeout)
+    host = getattr(config, "OPENALGO_HOST", "http://127.0.0.1:5000").rstrip("/")
+    api_key = getattr(config, "OPENALGO_API_KEY", "")
+    url = f"{host}/api/v1/multiquotes"
+
+    chunk_size = 15
+    for i in range(0, len(missing), chunk_size):
+        chunk = missing[i : i + chunk_size]
+        payload = json.dumps({
+            "apikey": api_key,
+            "symbols": [{"symbol": s, "exchange": exchange} for s in chunk],
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+            if isinstance(res, dict) and res.get("status") == "success":
+                for item in res.get("results") or []:
+                    if isinstance(item, dict) and item.get("symbol") and isinstance(item.get("data"), dict):
+                        quotes_map[item["symbol"]] = item["data"]
+        except Exception as e:
+            print(f"[SCREENER WARN] REST batch {i // chunk_size + 1} failed: {e}")
+
+        if i + chunk_size < len(missing):
+            time.sleep(0.5)
+
+    return quotes_map
 
 
 def select_trending_sensex_stocks(broker):
@@ -113,7 +149,6 @@ def select_trending_sensex_stocks(broker):
     stock_min_move = getattr(config, "STOCK_MIN_MOVE_PCT", 0.80)
     max_notional = getattr(config, "EQUITY_MAX_NOTIONAL", 25000.0)
 
-    # 1. Fetch Multi-Quotes for all 30 Sensex Constituents on NSE
     quotes_map = _fetch_sensex30_quotes(broker, symbols, exchange)
 
     pct_moves = []
@@ -127,9 +162,9 @@ def select_trending_sensex_stocks(broker):
 
     if len(pct_moves) < 15:
         print(
-            f"[ERROR] Insufficient Sensex-30 constituent quotes ({len(pct_moves)}/30 < 15 required). "
-            "Standing down."
+            f"[ERROR] Insufficient Sensex-30 breadth ({len(pct_moves)}/30 valid quotes). Standing down."
         )
+        print("[TIP] If OpenAlgo was restarted mid-day, restart OpenAlgo cleanly and verify broker login.")
         return "SIDEWAYS", "NONE", []
 
     index_pct_change = sum(pct_moves) / len(pct_moves)
@@ -158,13 +193,12 @@ def select_trending_sensex_stocks(broker):
         print("=" * 84)
         return regime, direction, []
 
-    # 2. Filter & Rank Top 3 Movers in Regime Direction
-    max_affordable_price = max_notional / 5.0  # Ensures at least 5 shares fit inside ₹25,000 notional
+    max_affordable_price = max_notional / 5.0
     candidates = []
 
     for sym in symbols:
         q = quotes_map.get(sym)
-        if not q:
+        if not isinstance(q, dict):
             continue
 
         ltp = float(q.get("ltp", 0) or 0)
@@ -176,7 +210,6 @@ def select_trending_sensex_stocks(broker):
         if ltp <= 0 or prev_close <= 0:
             continue
 
-        # Strict depth validation (never allow zero/uninitialized depth)
         if bid <= 0 or ask <= 0 or ask < bid:
             continue
 
