@@ -135,7 +135,7 @@ def run_v3_engine():
 
   # Dynamic capital-normalized premium band & ₹500 max risk SL cap
   min_cap = getattr(config, "MIN_CAPITAL_PER_LOT", 4000.0)
-  max_cap = getattr(config, "MAX_CAPITAL_PER_LOT", 5000.0)
+  max_cap = getattr(config, "MAX_CAPITAL_PER_LOT", 5500.0)
   min_prem = round(min_cap / qty, 2)
   max_prem = round(max_cap / qty, 2)
   max_sl_points = round(MAX_RISK_PER_TRADE / qty, 2)

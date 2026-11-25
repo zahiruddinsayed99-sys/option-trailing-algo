@@ -401,6 +401,7 @@ class BrokerAdapter:
 
     for chunk in chunks:
       chunk_success = False
+      rate_limited = False
       if self.client and hasattr(self.client, "multiquotes"):
         try:
           resp = self.client.multiquotes(symbols=chunk)
@@ -411,25 +412,33 @@ class BrokerAdapter:
                 if not isinstance(item, dict):
                   continue
                 sym = item.get("symbol")
+                ex = item.get("exchange", exchange)
                 data = item.get("data")
                 if sym and isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
                   parsed = self._parse_depth_payload(data)
                   parsed["symbol"] = sym
                   results[sym] = parsed
+                  with self._quote_lock:
+                    self._quote_cache[(sym, ex)] = (time.monotonic(), parsed)
             elif isinstance(resp.get("data"), list):
               for item in resp.get("data", []):
                 if not isinstance(item, dict):
                   continue
                 sym = item.get("symbol")
+                ex = item.get("exchange", exchange)
                 if sym and float(item.get("ltp", 0) or 0) > 0:
                   parsed = self._parse_depth_payload(item)
                   parsed["symbol"] = sym
                   results[sym] = parsed
+                  with self._quote_lock:
+                    self._quote_cache[(sym, ex)] = (time.monotonic(), parsed)
             chunk_success = any(item["symbol"] in results for item in chunk)
         except Exception as e:
           print(f"[MULTIQUOTES WARNING] chunk failed: {e}")
+          if "429" in str(e) or "rate limit" in str(e).lower():
+            rate_limited = True
 
-      if not chunk_success:
+      if not chunk_success and not rate_limited:
         for item in chunk:
           sym = item["symbol"]
           ex = item.get("exchange", exchange)
@@ -437,6 +446,17 @@ class BrokerAdapter:
           if q:
             q["symbol"] = sym
             results[sym] = q
+      elif rate_limited:
+        with self._quote_lock:
+          now_t = time.monotonic()
+          for item in chunk:
+            sym = item["symbol"]
+            ex = item.get("exchange", exchange)
+            cached = self._quote_cache.get((sym, ex))
+            if cached and (now_t - cached[0]) <= 5.0:
+              q = dict(cached[1])
+              q["symbol"] = sym
+              results[sym] = q
 
     return results
 

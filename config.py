@@ -27,7 +27,7 @@ MAX_DAILY_LOSS = -800.0
 ESTIMATED_CHARGES_PER_TRADE = 55.0
 
 # --- V3.4 CAPITAL-NORMALIZED POSITION SIZING ---
-# Standard Non-Expiry Days: ₹4,000 - ₹5,000 per lot (SENSEX: ₹200-₹250 | NIFTY: ₹61.55-₹76.90)
+# Standard Non-Expiry Days: ₹4,000 - ₹5,500 per lot (SENSEX: ₹200-₹275 | NIFTY: ₹61.55-₹84.60)
 # Expiry Days (0-DTE): ₹1,500 - ₹2,500 per lot if trading 0-DTE, or switch to Next-Week Expiry
 IS_EXPIRY_DAY = os.getenv("IS_EXPIRY_DAY", "FALSE").upper() == "TRUE"
 if IS_EXPIRY_DAY:

@@ -63,8 +63,16 @@ def _get_expiry_strikes(index_name: str, opt_type: str, spot: float):
 
     # 0-DTE Expiry-Day Gamma/Theta Guardrail
     if selected_exp == today:
+        min_cap = getattr(config, "MIN_CAPITAL_PER_LOT", 4000.0)
+        max_cap = getattr(config, "MAX_CAPITAL_PER_LOT", 5500.0)
         print(f"\n[0-DTE EXPIRY WARNING] Nearest expiry ({selected_exp}) is TODAY!")
-        print("  On 0-DTE, ₹4K-₹5.5K/lot forces Deep ITM/ATM strikes with wide spreads & extreme gamma.")
+        if getattr(config, "IS_EXPIRY_DAY", False):
+            print(f"  IS_EXPIRY_DAY=TRUE is active (Band: ₹{min_cap:,.0f}-₹{max_cap:,.0f}/lot); watch for 0-DTE spreads & gamma.")
+        else:
+            print(
+                f"  On 0-DTE, ₹{min_cap/1000:.1f}K-₹{max_cap/1000:.1f}K/lot forces Deep ITM/ATM strikes "
+                "with wide spreads & extreme gamma."
+            )
         if len(distinct_expiries) > 1:
             next_exp = distinct_expiries[1]
             choice = input(f"  Switch to Next-Week Expiry ({next_exp})? [Y/n]: ").strip().lower()
