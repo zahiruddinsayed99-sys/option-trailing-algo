@@ -314,29 +314,55 @@ class BrokerAdapter:
           "open": price,
       }
 
-    # 1. Primary: Zero-REST OpenAlgo WebSocket cache
+
+# 1. Primary: Zero-REST OpenAlgo WebSocket cache
     if self.ws_connected:
       self.ensure_subscribed(symbol, exchange)
       try:
         ws_q = self.client.get_quotes(symbol=symbol, exchange=exchange)
         data = ws_q.get("data", ws_q) if isinstance(ws_q, dict) else None
         if isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
-          return self._parse_depth_payload(data)
+          parsed = self._parse_depth_payload(data)
+          if parsed:
+            if not hasattr(self, "_quote_cache"):
+              self._quote_cache = {}
+            self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
+            return parsed
       except Exception:
         pass
 
-    # 2. Fallback: Single REST quote check (no retry storms on 429)
+    # 2. Short-TTL Cache & Throttled Single-Batch Multiquote Fallback (Zero 429 / Zero false None)
+    if not hasattr(self, "_quote_cache"):
+      self._quote_cache = {}
+    now_t = time.monotonic()
+    cached = self._quote_cache.get((symbol, exchange))
+    last_rest_t = getattr(self, "_last_rest_quote_ts", 0.0)
+
+    if now_t - last_rest_t < 0.6:
+      if cached and (now_t - cached[0]) <= 2.0:
+        return cached[1]
+      time.sleep(max(0.05, 0.6 - (now_t - last_rest_t)))
+
+    self._last_rest_quote_ts = time.monotonic()
     try:
-      quote = self.client.quotes(symbol=symbol, exchange=exchange)
-      if isinstance(quote, dict) and quote.get("status") == "success" and "data" in quote:
-        data = quote["data"]
-        if float(data.get("ltp", 0) or 0) > 0:
-          return self._parse_depth_payload(data)
+      mq = self.client.multiquotes(symbols=[{"symbol": symbol, "exchange": exchange}])
+      if isinstance(mq, dict) and mq.get("status") == "success":
+        for item in mq.get("results", []):
+          if isinstance(item, dict) and item.get("symbol") == symbol and isinstance(item.get("data"), dict):
+            data = item["data"]
+            if float(data.get("ltp", 0) or 0) > 0:
+              parsed = self._parse_depth_payload(data)
+              if parsed:
+                self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
+                return parsed
     except Exception as e:
       print(f"[QUOTE WARNING] {symbol}: {e}")
 
-    return None
+    if cached and (time.monotonic() - cached[0]) <= 3.0:
+      return cached[1]
 
+    return None
+  
   def get_multiquotes(self, symbols, exchange="NSE"):
     """Fetches quotes for multiple symbols with safe chunking, fallback, and SIMULATION support."""
     norm_symbols = []

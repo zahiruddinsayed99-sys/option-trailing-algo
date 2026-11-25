@@ -493,9 +493,10 @@ def run_v3_engine():
               print(
                   f"[SKIP BREAKOUT] Close {c_close:.2f} > 5% Chase Guard ({chase_limit:.2f})."
               )
-            elif spread_now > max_spread:
+            elif spread_now > max(max_spread, round(c_close * 0.005, 2)):
+              eff_spread = max(max_spread, round(c_close * 0.005, 2))
               print(
-                  f"[SKIP BREAKOUT] Spread ₹{spread_now:.2f} > Max ₹{max_spread:.2f}."
+                  f"[SKIP BREAKOUT] Spread ₹{spread_now:.2f} > Max ₹{eff_spread:.2f}."
               )
             else:
               order_resp = broker.place_market_order(active_sym, exchange, "BUY", qty)
