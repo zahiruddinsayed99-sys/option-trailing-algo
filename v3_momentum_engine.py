@@ -299,7 +299,7 @@ def run_v3_engine():
                 cand_q
                 and cand_q.get("valid_depth", True)
                 and cand_q["ltp"] <= max_prem
-                and cand_q["spread"] <= max_spread
+                and cand_q["spread"] <= max(max_spread, round(cand_q["ltp"] * 0.005, 2))
             ):
               print(
                   f"\n>>> [OTM ROTATE UP] {active_sym} LTP ₹{curr_ltp:.2f} > ₹{max_prem:.2f}."
@@ -321,7 +321,7 @@ def run_v3_engine():
                 cand_q
                 and cand_q.get("valid_depth", True)
                 and min_prem <= cand_q["ltp"] <= max_prem
-                and cand_q["spread"] <= max_spread
+                and cand_q["spread"] <= max(max_spread, round(cand_q["ltp"] * 0.005, 2))
             ):
               print(
                   f"\n>>> [OTM ROTATE DOWN] {active_sym} LTP ₹{curr_ltp:.2f} < ₹{min_prem:.2f}."

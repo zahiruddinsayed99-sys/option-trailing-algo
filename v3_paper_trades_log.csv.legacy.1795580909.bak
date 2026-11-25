@@ -1,2 +1,0 @@
-Date,Symbol,Entry_Time,Exit_Time,Entry_Price,Initial_SL,Risk_Pct,Exit_Price,Highest_Price,Qty,Gross_PnL,Net_PnL,Highest_Stage,Exit_Reason
-2026-11-23,SENSEX26NOV2682000PE,12:55:24,15:15:12,286.2,261.2,8.74,275.2,289.4,20,-220.0,-248.07,INITIAL_BASE_SL,EOD Square-Off

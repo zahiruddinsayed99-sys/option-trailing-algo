@@ -55,26 +55,45 @@ def _compute_rvol(symbol: str, volume: float) -> float:
     return 1.0
 
 
+def _extract_prev_close(q: dict) -> float:
+    """Extracts previous close across OpenAlgo payload key variants, falling back to open."""
+    return float(
+        q.get("prev_close")
+        or q.get("prevclose")
+        or q.get("close")
+        or q.get("open")
+        or 0
+    )
+
+
 def _fetch_sensex30_quotes(broker, symbols: list[str], exchange: str) -> dict:
     """Fetches and normalizes OpenAlgo multiquotes response {'results': [{'symbol': ..., 'data': {...}}]}."""
     quotes_map = {}
 
     if getattr(broker, "mode", "") == "OPENALGO" and getattr(broker, "client", None) is not None:
-        payload = [{"symbol": s, "exchange": exchange} for s in symbols]
-        res = broker.client.multiquotes(symbols=payload)
-        if isinstance(res, dict) and res.get("status") == "success":
-            for item in res.get("results", []):
-                sym = item.get("symbol")
-                data = item.get("data") or {}
-                if sym and isinstance(data, dict):
-                    quotes_map[sym] = data
-        if quotes_map:
-            return quotes_map
+        try:
+            payload = [{"symbol": s, "exchange": exchange} for s in symbols]
+            res = broker.client.multiquotes(symbols=payload)
+            if isinstance(res, dict) and res.get("status") == "success":
+                for item in (res.get("results") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    sym = item.get("symbol")
+                    data = item.get("data") or {}
+                    if sym and isinstance(data, dict):
+                        quotes_map[sym] = data
+            if quotes_map:
+                return quotes_map
+        except Exception as e:
+            print(f"[SCREENER WARNING] Direct multiquotes failed, falling back to adapter: {e}")
 
     # Fallback for SIMULATION mode or custom adapter mapping
-    fallback = broker.get_multiquotes(symbols, exchange)
-    if isinstance(fallback, dict):
-        return fallback
+    try:
+        fallback = broker.get_multiquotes(symbols, exchange)
+        if isinstance(fallback, dict):
+            return fallback
+    except Exception as e:
+        print(f"[SCREENER WARNING] Fallback multiquotes failed: {e}")
     return {}
 
 
@@ -99,13 +118,18 @@ def select_trending_sensex_stocks(broker):
 
     pct_moves = []
     for sym, q in quotes_map.items():
+        if not isinstance(q, dict):
+            continue
         ltp = float(q.get("ltp", 0) or 0)
-        prev = float(q.get("prev_close", 0) or q.get("open", 0) or 0)
+        prev = _extract_prev_close(q)
         if ltp > 0 and prev > 0:
             pct_moves.append(((ltp - prev) / prev) * 100.0)
 
-    if not pct_moves:
-        print("[ERROR] Failed to fetch Sensex-30 constituent quotes from broker. Standing down.")
+    if len(pct_moves) < 15:
+        print(
+            f"[ERROR] Insufficient Sensex-30 constituent quotes ({len(pct_moves)}/30 < 15 required). "
+            "Standing down."
+        )
         return "SIDEWAYS", "NONE", []
 
     index_pct_change = sum(pct_moves) / len(pct_moves)
@@ -144,7 +168,7 @@ def select_trending_sensex_stocks(broker):
             continue
 
         ltp = float(q.get("ltp", 0) or 0)
-        prev_close = float(q.get("prev_close", 0) or q.get("open", 0) or 0)
+        prev_close = _extract_prev_close(q)
         bid = float(q.get("bid", 0) or 0)
         ask = float(q.get("ask", 0) or 0)
         volume = float(q.get("volume", 0) or 0)

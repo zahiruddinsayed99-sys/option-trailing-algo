@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .env
 *.csv
+*.bak
 config_local.py

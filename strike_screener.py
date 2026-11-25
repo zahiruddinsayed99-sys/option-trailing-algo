@@ -62,13 +62,16 @@ def _get_expiry_strikes(index_name: str, opt_type: str, spot: float):
     selected_exp = distinct_expiries[0]
 
     # 0-DTE Expiry-Day Gamma/Theta Guardrail
-    if selected_exp == today and len(distinct_expiries) > 1:
-        next_exp = distinct_expiries[1]
+    if selected_exp == today:
         print(f"\n[0-DTE EXPIRY WARNING] Nearest expiry ({selected_exp}) is TODAY!")
         print("  On 0-DTE, ₹4K-₹5.5K/lot forces Deep ITM/ATM strikes with wide spreads & extreme gamma.")
-        choice = input(f"  Switch to Next-Week Expiry ({next_exp})? [Y/n]: ").strip().lower()
-        if choice != "n":
-            selected_exp = next_exp
+        if len(distinct_expiries) > 1:
+            next_exp = distinct_expiries[1]
+            choice = input(f"  Switch to Next-Week Expiry ({next_exp})? [Y/n]: ").strip().lower()
+            if choice != "n":
+                selected_exp = next_exp
+        else:
+            print("  [NOTE] No further expiry contracts found in DB; proceeding with today's 0-DTE expiry.")
 
     expiry_rows = [r for r in valid_rows if r[0] == selected_exp]
     selected_exp_str = expiry_rows[0][1]
@@ -179,14 +182,17 @@ def run_strike_screener():
         ltp = float(d.get("ltp", 0) or 0)
         bid = float(d.get("bid", 0) or 0)
         ask = float(d.get("ask", 0) or 0)
-        if ltp <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+        if ltp <= 0:
             continue
 
-        spread = round(ask - bid, 2)
+        valid_depth = bid > 0 and ask > 0 and ask >= bid
+        spread = round(ask - bid, 2) if valid_depth else 999.0
         cap_per_lot = ltp * lot
         eff_max_spread = max(getattr(config, "MAX_SPREAD", 1.00), round(ltp * 0.005, 2))
 
-        if cap_per_lot > max_cap:
+        if not valid_depth:
+            status = "NO DEPTH"
+        elif cap_per_lot > max_cap:
             status = f"EXPENSIVE (>₹{max_cap/1000:.1f}K)"
         elif cap_per_lot < min_cap:
             status = f"DEEP OTM (<₹{min_cap/1000:.1f}K)"
@@ -196,10 +202,13 @@ def run_strike_screener():
             status = "SWEET SPOT"
             sweet_spots.append(sym)
 
-        all_valid.append((sym, strike, cap_per_lot))
+        if valid_depth and spread <= eff_max_spread:
+            all_valid.append((sym, strike, cap_per_lot))
+
+        spread_disp = f"₹{spread:<6.2f}" if valid_depth else "N/A    "
         print(
             f"{sym:<24} | {int(strike):<8} | ₹{ltp:<7.2f} | ₹{cap_per_lot:<10.0f} | "
-            f"₹{spread:<6.2f} | {status}"
+            f"{spread_disp} | {status}"
         )
 
     print("\n" + "=" * 82)

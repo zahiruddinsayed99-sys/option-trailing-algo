@@ -14,6 +14,9 @@ class BrokerAdapter:
     self.ws_connected = False
     self.subscribed = set()
     self._sub_lock = threading.Lock()
+    self._quote_lock = threading.Lock()
+    self._quote_cache = {}
+    self._last_rest_quote_ts = 0.0
     self.sim_step = 0
     self.sim_regime = os.getenv("SIM_REGIME", "BULLISH").upper()
     self.sim_equity_steps = {}
@@ -315,7 +318,7 @@ class BrokerAdapter:
       }
 
 
-# 1. Primary: Zero-REST OpenAlgo WebSocket cache
+    # 1. Primary: Zero-REST OpenAlgo WebSocket cache
     if self.ws_connected:
       self.ensure_subscribed(symbol, exchange)
       try:
@@ -324,45 +327,55 @@ class BrokerAdapter:
         if isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
           parsed = self._parse_depth_payload(data)
           if parsed:
-            if not hasattr(self, "_quote_cache"):
-              self._quote_cache = {}
-            self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
+            with self._quote_lock:
+              self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
             return parsed
       except Exception:
         pass
 
     # 2. Short-TTL Cache & Throttled Single-Batch Multiquote Fallback (Zero 429 / Zero false None)
-    if not hasattr(self, "_quote_cache"):
-      self._quote_cache = {}
-    now_t = time.monotonic()
-    cached = self._quote_cache.get((symbol, exchange))
-    last_rest_t = getattr(self, "_last_rest_quote_ts", 0.0)
+    with self._quote_lock:
+      now_t = time.monotonic()
+      cached = self._quote_cache.get((symbol, exchange))
+      last_rest_t = self._last_rest_quote_ts
+      wait_s = 0.0
+      if now_t - last_rest_t < 0.6:
+        if cached and (now_t - cached[0]) <= 2.5:
+          return cached[1]
+        wait_s = max(0.05, 0.6 - (now_t - last_rest_t))
 
-    if now_t - last_rest_t < 0.6:
-      if cached and (now_t - cached[0]) <= 2.0:
+    if wait_s > 0.0:
+      time.sleep(wait_s)
+
+    with self._quote_lock:
+      now_t = time.monotonic()
+      cached = self._quote_cache.get((symbol, exchange))
+      if (now_t - self._last_rest_quote_ts) < 0.6 and cached and (now_t - cached[0]) <= 2.5:
         return cached[1]
-      time.sleep(max(0.05, 0.6 - (now_t - last_rest_t)))
+      self._last_rest_quote_ts = now_t
 
-    self._last_rest_quote_ts = time.monotonic()
     try:
       mq = self.client.multiquotes(symbols=[{"symbol": symbol, "exchange": exchange}])
       if isinstance(mq, dict) and mq.get("status") == "success":
-        for item in mq.get("results", []):
+        for item in (mq.get("results") or []):
           if isinstance(item, dict) and item.get("symbol") == symbol and isinstance(item.get("data"), dict):
             data = item["data"]
             if float(data.get("ltp", 0) or 0) > 0:
               parsed = self._parse_depth_payload(data)
               if parsed:
-                self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
+                with self._quote_lock:
+                  self._quote_cache[(symbol, exchange)] = (time.monotonic(), parsed)
                 return parsed
     except Exception as e:
       print(f"[QUOTE WARNING] {symbol}: {e}")
 
-    if cached and (time.monotonic() - cached[0]) <= 3.0:
-      return cached[1]
+    with self._quote_lock:
+      cached = self._quote_cache.get((symbol, exchange))
+      if cached and (time.monotonic() - cached[0]) <= 5.0:
+        return cached[1]
 
     return None
-  
+
   def get_multiquotes(self, symbols, exchange="NSE"):
     """Fetches quotes for multiple symbols with safe chunking, fallback, and SIMULATION support."""
     norm_symbols = []
@@ -392,15 +405,27 @@ class BrokerAdapter:
         try:
           resp = self.client.multiquotes(symbols=chunk)
           if isinstance(resp, dict) and resp.get("status") == "success":
-            data_list = resp.get("data", [])
-            if isinstance(data_list, list):
-              for item in data_list:
+            items = resp.get("results")
+            if isinstance(items, list):
+              for item in items:
+                if not isinstance(item, dict):
+                  continue
                 sym = item.get("symbol")
-                if sym:
+                data = item.get("data")
+                if sym and isinstance(data, dict) and float(data.get("ltp", 0) or 0) > 0:
+                  parsed = self._parse_depth_payload(data)
+                  parsed["symbol"] = sym
+                  results[sym] = parsed
+            elif isinstance(resp.get("data"), list):
+              for item in resp.get("data", []):
+                if not isinstance(item, dict):
+                  continue
+                sym = item.get("symbol")
+                if sym and float(item.get("ltp", 0) or 0) > 0:
                   parsed = self._parse_depth_payload(item)
                   parsed["symbol"] = sym
                   results[sym] = parsed
-              chunk_success = True
+            chunk_success = any(item["symbol"] in results for item in chunk)
         except Exception as e:
           print(f"[MULTIQUOTES WARNING] chunk failed: {e}")
 
