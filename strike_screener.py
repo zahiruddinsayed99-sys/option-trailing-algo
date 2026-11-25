@@ -45,9 +45,9 @@ def screen_strikes():
       """
       SELECT symbol, expiry, strike, lotsize
       FROM symtoken
-      WHERE exchange = ? AND name = ? AND instrumenttype = 'OPTIDX' AND symbol LIKE ?
+      WHERE exchange = ? AND name = ? AND instrumenttype = ? AND symbol LIKE ?
       """,
-      (exchange, idx_in, f"%{opt_in}"),
+      (exchange, idx_in, opt_in, f"{idx_in}%{opt_in}"),
   )
   rows = cur.fetchall()
   conn.close()
