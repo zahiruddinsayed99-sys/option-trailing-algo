@@ -31,6 +31,15 @@ VOLUME_SURGE_MULTIPLIER = 1.5  # Min 1.5x rolling 10-candle volume surge
 MAX_QUOTE_FAILURES = 10      # Stale-feed circuit breaker threshold (~20-30s dead feed)
 
 
+def _parse_hhmm(hhmm_str, default_time):
+  """Safely parses 'HH:MM' config strings into datetime.time objects."""
+  try:
+    h, m = map(int, str(hhmm_str).strip().split(":"))
+    return datetime.time(h, m)
+  except Exception:
+    return default_time
+
+
 def init_csv():
   """Ensures 12-column schema compliance and loads today's realized P&L/trades on restart."""
   needs_header = True
@@ -115,12 +124,15 @@ def check_volume_surge(candles, current_vol):
 
 
 def hydrate_symbol_history(broker, sym, exchange):
-  """Hydrates morning 3m candles from 09:15 AM, computing cumulative Session VWAP and base boundaries."""
+  """Hydrates morning 3m candles from 09:15 AM, computing cumulative Session VWAP and configured Freeze Box boundaries."""
   hist_candles = broker.fetch_intraday_history(sym, exchange, interval="3m")
   sum_pv = 0.0
   sum_vol = 0.0
   base_high = None
   base_low = None
+
+  obs_t = _parse_hhmm(getattr(config, "EQUITY_OBSERVE_START", "10:15"), datetime.time(10, 15))
+  win_t = _parse_hhmm(getattr(config, "EQUITY_WINDOW_START", "11:00"), datetime.time(11, 0))
 
   for c in hist_candles:
     h = c["high"]
@@ -132,8 +144,14 @@ def hydrate_symbol_history(broker, sym, exchange):
     sum_vol += vol
 
     ts = c.get("timestamp", "")
-    # Check if candle lies within Freeze-Hour (10:30 - 11:30 AM)
-    if any(tag in ts for tag in ("10:3", "10:4", "10:5", "11:0", "11:1", "11:2")):
+    # Dynamically check if candle lies within configured Freeze Box (e.g., 10:15 - 11:00 AM)
+    try:
+      time_part = ts.split(" ")[1][:5] if " " in ts else ts[:5]
+      c_time = _parse_hhmm(time_part, None)
+    except Exception:
+      c_time = None
+
+    if c_time is not None and obs_t <= c_time < win_t:
       base_high = h if base_high is None else max(base_high, h)
       base_low = l if base_low is None else min(base_low, l)
 
@@ -151,6 +169,18 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
   max_notional = getattr(config, "EQUITY_MAX_NOTIONAL", 25000.0)
   charges_per_trade = getattr(config, "EQUITY_ESTIMATED_CHARGES", 35.0)
   exchange = getattr(config, "EQUITY_EXCHANGE", "NSE")
+
+  # Configurable Session Time Windows (IST)
+  if config.MODE == "SIMULATION":
+    observe_start = datetime.time(0, 0)
+    window_start = datetime.time(0, 0)
+    window_end = datetime.time(23, 59)
+    eod_exit_time = datetime.time(23, 59)
+  else:
+    observe_start = _parse_hhmm(getattr(config, "EQUITY_OBSERVE_START", "10:15"), datetime.time(10, 15))
+    window_start = _parse_hhmm(getattr(config, "EQUITY_WINDOW_START", "11:00"), datetime.time(11, 0))
+    window_end = _parse_hhmm(getattr(config, "EQUITY_WINDOW_END", "13:30"), datetime.time(13, 30))
+    eod_exit_time = _parse_hhmm(getattr(config, "EQUITY_EOD_EXIT", "15:10"), datetime.time(15, 10))
 
   # 1. Startup Guardrail Check
   if trades_today >= max_trades:
@@ -192,6 +222,10 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
   print("\n" + "=" * 80)
   print(f"   V1.0 NSE CASH EQUITY INTRADAY ENGINE [{config.MODE}]")
   print(f"   Direction: {direction} | Watchlist: {watch_symbols}")
+  print(
+      f"   Session Windows: Freeze Box [{observe_start.strftime('%H:%M')} - {window_start.strftime('%H:%M')}]"
+      f" | Trade [{window_start.strftime('%H:%M')} - {window_end.strftime('%H:%M')}]"
+  )
   print(f"   Max Risk/Trade: ₹{max_risk_trade:.2f} | Max Notional: ₹{max_notional:.2f} | Daily Loss Cap: ₹{max_daily_loss:.2f}")
   print(f"   Resume State: {trades_today}/{max_trades} trades executed today (P&L: ₹{daily_pnl:.2f})")
   print("=" * 80 + "\n")
@@ -250,21 +284,9 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
         print(f"\n[KILL SWITCH TRIGGERED] Daily P&L ₹{daily_pnl:.2f} <= ₹{max_daily_loss:.2f}. Halting.")
         break
 
-      # 5. Time Windows Configuration
-      if config.MODE == "SIMULATION":
-        observe_start = datetime.time(0, 0)
-        window_start = datetime.time(0, 0)
-        window_end = datetime.time(23, 59)
-        eod_exit_time = datetime.time(23, 59)
-      else:
-        observe_start = datetime.time(10, 30)
-        window_start = datetime.time(11, 30)
-        window_end = datetime.time(13, 30)
-        eod_exit_time = datetime.time(15, 10)
-
-      # EOD MIS Square-Off check (15:10 IST)
+      # 5. EOD MIS Square-Off check
       if in_trade and now_t >= eod_exit_time:
-        print(f"\n[EOD MIS SQUARE-OFF] 15:10 IST cutoff reached. Closing active {direction} position...")
+        print(f"\n[EOD MIS SQUARE-OFF] {eod_exit_time.strftime('%H:%M')} IST cutoff reached. Closing active {direction} position...")
         exit_action = "SELL" if direction == "LONG" else "BUY"
         exit_resp = broker.place_market_order(active_sym, exchange, exit_action, qty, strategy="V1_Equity_Intraday_Engine")
         if exit_resp and exit_resp.get("status") == "success":
@@ -496,7 +518,7 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
           if st["sum_vol"] > 0:
             st["session_vwap"] = round(st["sum_pv"] / st["sum_vol"], 2)
 
-          # Freeze-Hour tracking (10:30 - 11:30 AM)
+          # Freeze-Box tracking (configurable via EQUITY_OBSERVE_START - EQUITY_WINDOW_START)
           if observe_start <= now_t < window_start:
             st["base_high"] = c_high if st["base_high"] is None else max(st["base_high"], c_high)
             st["base_low"] = c_low if st["base_low"] is None else min(st["base_low"], c_low)
@@ -560,7 +582,7 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
                     break
                   continue
 
-          # Hunting Window Entry Signals (11:30 AM - 01:30 PM)
+          # Hunting Window Entry Signals (configurable via EQUITY_WINDOW_START - EQUITY_WINDOW_END)
           if not in_trade and window_start <= now_t < window_end:
             if st["base_high"] is None or st["base_low"] is None:
               continue
