@@ -508,33 +508,49 @@ class BrokerAdapter:
       return []
 
   def fetch_freeze_hour_base(self, symbol, exchange):
-    """Backfills 10:30-11:30 AM 3m candles if started late or on symbol rotation."""
-    if self.mode == "SIMULATION":
-      hist = self._get_sim_history(symbol, exchange, "3m")
-      freeze_candles = hist[25:]
-      bh = max(c["high"] for c in freeze_candles) if freeze_candles else None
-      bl = min(c["low"] for c in freeze_candles) if freeze_candles else None
-      return bh, bl, freeze_candles
+      """Backfills configured Freeze Box 3m candles if started late or on symbol rotation."""
+      if self.mode == "SIMULATION":
+        hist = self._get_sim_history(symbol, exchange, "3m")
+        freeze_candles = hist[25:]
+        bh = max(c["high"] for c in freeze_candles) if freeze_candles else None
+        bl = min(c["low"] for c in freeze_candles) if freeze_candles else None
+        return bh, bl, freeze_candles
 
-    if not self.client:
-      return None, None, []
+      if not self.client:
+        return None, None, []
 
-    try:
-      today_str = datetime.date.today().strftime("%Y-%m-%d")
-      candles = self.fetch_intraday_history(symbol, exchange, "3m", today_str, today_str)
-      base_high = None
-      base_low = None
-      freeze_candles = []
-      for c in candles:
-        ts_str = c.get("timestamp", "")
-        if any(tag in ts_str for tag in ("10:3", "10:4", "10:5", "11:0", "11:1", "11:2")):
-          freeze_candles.append(c)
-          base_high = c["high"] if base_high is None else max(base_high, c["high"])
-          base_low = c["low"] if base_low is None else min(base_low, c["low"])
-      return base_high, base_low, freeze_candles or candles[-20:]
-    except Exception:
-      return None, None, []
+      def _to_time(hhmm_str, default_t):
+        try:
+          h, m = map(int, str(hhmm_str).strip().split(":"))
+          return datetime.time(h, m)
+        except Exception:
+          return default_t
 
+      obs_t = _to_time(getattr(config, "OPTIONS_OBSERVE_START", "10:15"), datetime.time(10, 15))
+      win_t = _to_time(getattr(config, "OPTIONS_WINDOW_START", "11:00"), datetime.time(11, 0))
+
+      try:
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        candles = self.fetch_intraday_history(symbol, exchange, "3m", today_str, today_str)
+        base_high = None
+        base_low = None
+        freeze_candles = []
+        for c in candles:
+          ts_str = c.get("timestamp", "")
+          try:
+            time_part = ts_str.split(" ")[1][:5] if " " in ts_str else ts_str[:5]
+            c_time = _to_time(time_part, None)
+          except Exception:
+            c_time = None
+
+          if c_time is not None and obs_t <= c_time < win_t:
+            freeze_candles.append(c)
+            base_high = c["high"] if base_high is None else max(base_high, c["high"])
+            base_low = c["low"] if base_low is None else min(base_low, c["low"])
+        return base_high, base_low, freeze_candles or candles[-15:]
+      except Exception:
+        return None, None, []
+      
   def _fetch_executed_price(self, orderid):
     """Queries OpenAlgo orderbook once to retrieve exact executed average_price."""
     if not orderid or orderid == "UNKNOWN" or not self.client:

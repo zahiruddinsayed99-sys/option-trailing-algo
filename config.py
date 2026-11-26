@@ -25,7 +25,12 @@ CANDIDATE_STRIKES = [
 ]
 SYMBOL = CANDIDATE_STRIKES[0]
 EQUITY_WATCHLIST = ['BAJFINANCE', 'HINDUNILVR', 'BAJAJFINSV']
-EQUITY_DIRECTION = "SHORT"
+EQUITY_DIRECTION = "SHORT" # "LONG" or "SHORT"
+OPTIONS_OBSERVE_START = "10:15"   # Freeze Box start (IST)
+OPTIONS_WINDOW_START  = "11:00"   # Freeze Box end & Entry window start (IST)
+OPTIONS_WINDOW_END    = "13:30"   # Entry window cutoff (IST)
+OPTIONS_EOD_EXIT      = "15:15"   # MIS square-off time (IST)
+
 EQUITY_OBSERVE_START = "10:15"   # Freeze Box start (IST)
 EQUITY_WINDOW_START  = "11:00"   # Freeze Box end & Entry window start (IST)
 EQUITY_WINDOW_END    = "13:30"   # Entry window cutoff (IST)

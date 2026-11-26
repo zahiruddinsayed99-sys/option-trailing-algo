@@ -28,6 +28,15 @@ MIN_OBSERVE_CANDLES = 4      # Minimum 4 candles (12 mins) if started late
 MAX_QUOTE_FAILURES = 10      # Circuit breaker threshold (~20-30s dead feed)
 
 
+def _parse_hhmm(hhmm_str, default_time):
+  """Safely parses 'HH:MM' config strings into datetime.time objects."""
+  try:
+    h, m = map(int, str(hhmm_str).strip().split(":"))
+    return datetime.time(h, m)
+  except Exception:
+    return default_time
+
+
 def init_csv():
   """Ensures 11-column schema compliance and loads today's realized P&L/trades on restart."""
   needs_header = True
@@ -100,7 +109,7 @@ def current_candle_bucket():
 
 
 def sync_strike_history(broker, state, sym, exchange):
-  """Hydrates Freeze-Hour (10:30-11:30 AM) base_high/base_low on OTM rotation."""
+  """Hydrates configured Freeze Box base_high/base_low on OTM rotation."""
   st = state[sym]
   if st["base_high"] is not None:
     return
@@ -111,7 +120,7 @@ def sync_strike_history(broker, state, sym, exchange):
     if hist_candles:
       st["candles"] = hist_candles
     print(
-        f"[BASE SYNCED | {sym}] Hydrated Freeze-Hour Base from history:"
+        f"[BASE SYNCED | {sym}] Hydrated Freeze-Box Base from history:"
         f" [{bl:.2f} - {bh:.2f}] ({len(hist_candles)} candles)"
     )
 
@@ -148,6 +157,18 @@ def run_v3_engine():
       else MAX_SPREAD_STOCK
   )
 
+  # Configurable Session Time Windows (IST)
+  if config.MODE == "SIMULATION":
+    observe_start = datetime.time(0, 0)
+    window_start = datetime.time(0, 0)
+    window_end = datetime.time(23, 59)
+    eod_exit_time = datetime.time(23, 59)
+  else:
+    observe_start = _parse_hhmm(getattr(config, "OPTIONS_OBSERVE_START", "10:15"), datetime.time(10, 15))
+    window_start = _parse_hhmm(getattr(config, "OPTIONS_WINDOW_START", "11:00"), datetime.time(11, 0))
+    window_end = _parse_hhmm(getattr(config, "OPTIONS_WINDOW_END", "13:30"), datetime.time(13, 30))
+    eod_exit_time = _parse_hhmm(getattr(config, "OPTIONS_EOD_EXIT", "15:15"), datetime.time(15, 15))
+
   state = {
       s: {
           "ticks": [],
@@ -162,7 +183,8 @@ def run_v3_engine():
 
   active_idx = 0
   active_sym = strikes[active_idx]
-  started_late = datetime.datetime.now().time() >= datetime.time(11, 18)
+  late_cutoff_dt = datetime.datetime.combine(datetime.date.today(), window_start) - datetime.timedelta(minutes=12)
+  started_late = (config.MODE != "SIMULATION") and (datetime.datetime.now() >= late_cutoff_dt)
 
   in_trade = False
   entry_price = 0.0
@@ -186,6 +208,8 @@ def run_v3_engine():
 
   print(
       f"\n>>> Starting V3.4 Engine [{config.MODE}] | {len(strikes)} Strikes Watched"
+      f" | Freeze [{observe_start.strftime('%H:%M')}-{window_start.strftime('%H:%M')}]"
+      f" | Trade [{window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}]"
       f" | Band (₹{min_cap:.0f}-₹{max_cap:.0f}/lot): ₹{min_prem:.2f}-₹{max_prem:.2f}"
       f" | Max SL: {max_sl_points:.2f} pts | Today's Resume: {trades_today}/{max_trades} trades (₹{daily_pnl:.2f}) <<<"
   )
@@ -203,18 +227,7 @@ def run_v3_engine():
         print(f"\n[KILL SWITCH TRIGGERED] Daily P&L ₹{daily_pnl:.2f} <= ₹{max_daily_loss:.2f}. Halting.")
         break
 
-      # 2. Time Windows
-      if config.MODE == "SIMULATION":
-        observe_start = datetime.time(0, 0)
-        window_start = datetime.time(0, 0)
-        window_end = datetime.time(23, 59)
-        eod_exit_time = datetime.time(23, 59)
-      else:
-        observe_start = datetime.time(10, 30)
-        window_start = datetime.time(11, 30)
-        window_end = datetime.time(13, 30)
-        eod_exit_time = datetime.time(15, 15)
-
+      # 2. Hunting Window Cutoff Check
       if not in_trade and now_t >= window_end:
         print(f"\n[WINDOW CLOSED] Past {window_end.strftime('%H:%M')} entry cutoff with no open position.")
         break
@@ -441,7 +454,7 @@ def run_v3_engine():
         c_close = st["ticks"][-1]
         st["ticks"].clear()
 
-        # Ignore pre-10:30 AM opening bell spikes
+        # Ignore pre-observe_start opening bell spikes
         if now_t < observe_start:
           continue
 
@@ -455,7 +468,7 @@ def run_v3_engine():
             or (started_late and len(st["candles"]) <= MIN_OBSERVE_CANDLES)
         )
 
-        # PHASE A: Bounded Freeze-Hour Base Observation (10:30 - 11:30 AM)
+        # PHASE A: Bounded Freeze-Box Base Observation (configured via OPTIONS_OBSERVE_START - OPTIONS_WINDOW_START)
         if now_t < window_start or need_warmup:
           st["base_high"] = (
               c_high if st["base_high"] is None else max(st["base_high"], c_high)
@@ -468,7 +481,7 @@ def run_v3_engine():
               f" Close: {c_close:.2f} | Base: [{st['base_low']:.2f} - {st['base_high']:.2f}]"
           )
 
-        # PHASE B: Active Entry Hunting (11:30 AM - 01:30 PM)
+        # PHASE B: Active Entry Hunting (configured via OPTIONS_WINDOW_START - OPTIONS_WINDOW_END)
         elif not in_trade:
           if not st["base_locked"]:
             st["base_locked"] = True
