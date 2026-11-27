@@ -17,7 +17,16 @@ except ImportError:
 
 # --- DEFAULT CONTRACT & MULTI-STRIKE WATCHLIST ---
 
+# --- DYNAMIC INDEX ROTATION (SENSEX primary -> NIFTY fallback when DTE < MIN_DTE) ---
+MIN_DTE = int(os.getenv("MIN_DTE", "2"))
+AUTO_INDEX_ROTATION = os.getenv("AUTO_INDEX_ROTATION", "TRUE").upper() == "TRUE"
+PRIMARY_INDEX = "SENSEX"
+PRIMARY_EXCHANGE = "BFO"
+FALLBACK_INDEX = "NIFTY"
+FALLBACK_EXCHANGE = "NFO"
+
 # --- DEFAULT STRATEGY PARAMETERS ---
+UNDERLYING = "NIFTY"
 EXCHANGE = "NFO"
 QTY = 65
 CANDIDATE_STRIKES = [
@@ -88,8 +97,11 @@ DAILY_EQUITY_LOADED = False
 
 def load_daily_targets(path=DAILY_TARGETS_PATH):
   """Overrides daily strikes/watchlist/regime from daily_targets.json if dated for today."""
-  global EXCHANGE, QTY, CANDIDATE_STRIKES, SYMBOL, EQUITY_WATCHLIST, EQUITY_DIRECTION
+  global UNDERLYING, EXCHANGE, QTY, CANDIDATE_STRIKES, SYMBOL, EQUITY_WATCHLIST, EQUITY_DIRECTION
   global DAILY_TARGETS_LOADED, DAILY_OPTIONS_LOADED, DAILY_EQUITY_LOADED
+  DAILY_TARGETS_LOADED = False
+  DAILY_OPTIONS_LOADED = False
+  DAILY_EQUITY_LOADED = False
   if not os.path.isfile(path):
     return False
   try:
@@ -108,10 +120,24 @@ def load_daily_targets(path=DAILY_TARGETS_PATH):
       if CANDIDATE_STRIKES:
         SYMBOL = CANDIDATE_STRIKES[0]
         DAILY_OPTIONS_LOADED = True
-    if opts.get("exchange"):
-      EXCHANGE = str(opts["exchange"]).strip().upper()
-    if opts.get("qty") and int(opts["qty"]) > 0:
-      QTY = int(opts["qty"])
+    if DAILY_OPTIONS_LOADED:
+      underlying_val = opts.get("underlying") or opts.get("index")
+      if underlying_val:
+        UNDERLYING = str(underlying_val).strip().upper()
+      if opts.get("exchange"):
+        EXCHANGE = str(opts["exchange"]).strip().upper()
+      elif UNDERLYING == "SENSEX":
+        EXCHANGE = "BFO"
+      elif UNDERLYING == "NIFTY":
+        EXCHANGE = "NFO"
+      if not underlying_val:
+        UNDERLYING = "SENSEX" if EXCHANGE == "BFO" else "NIFTY"
+      if opts.get("qty") and int(opts["qty"]) > 0:
+        QTY = int(opts["qty"])
+      elif EXCHANGE == "BFO" or UNDERLYING == "SENSEX":
+        QTY = 20
+      elif EXCHANGE == "NFO" or UNDERLYING == "NIFTY":
+        QTY = 65
 
     eq = data.get("equity") or {}
     wl = eq.get("watchlist")

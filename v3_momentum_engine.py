@@ -243,7 +243,8 @@ def run_v3_engine(auto_mode=False):
     strikes = list(default_list)
     exchange = config.EXCHANGE
     qty = int(config.QTY)
-    print(f"[AUTO MODE] Strikes: {strikes} | Exchange: {exchange} | Qty: {qty}")
+    underlying = getattr(config, "UNDERLYING", "SENSEX" if exchange == "BFO" else "NIFTY")
+    print(f"[AUTO MODE] Underlying: {underlying} | Exchange: {exchange} | Qty: {qty} | Strikes: {strikes}")
   else:
     sym_in = input(f"Candidate Strikes [{default_str}]: ").strip().upper()
     strikes = [s.strip() for s in sym_in.split(",") if s.strip()] if sym_in else list(default_list)
@@ -319,7 +320,8 @@ def run_v3_engine(auto_mode=False):
   sim_ticks_in_bucket = 0
 
   print(
-      f"\n>>> Starting V4.0 Confluence Engine [{config.MODE}] | {len(strikes)} Strikes Subscribed"
+      f"\n>>> Starting V4.0 Confluence Engine [{config.MODE}] | {getattr(config, 'UNDERLYING', exchange)} ({exchange})"
+      f" | Qty: {qty} | {len(strikes)} Strikes Subscribed"
       f" | Observe [{observe_start.strftime('%H:%M')}]"
       f" | Trade [{window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}]"
       f" | Band (₹{min_cap:.0f}-₹{max_cap:.0f}/lot): ₹{min_prem:.2f}-₹{max_prem:.2f}"

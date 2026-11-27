@@ -31,20 +31,24 @@ def _run_tmux(args: list[str], check: bool = True) -> subprocess.CompletedProces
 def save_daily_targets(options_res: dict, equity_res: dict, path: str = DAILY_TARGETS_PATH) -> dict:
   """Persists today's screener selections to daily_targets.json for config.py auto-loading."""
   now = datetime.datetime.now()
-  strikes = (options_res or {}).get("candidate_strikes") or list(config.CANDIDATE_STRIKES)
-  exchange = (options_res or {}).get("exchange") or config.EXCHANGE
-  qty = (options_res or {}).get("lotsize") or int(config.QTY)
+  opts_dict = options_res or {}
+  strikes = opts_dict.get("candidate_strikes") or list(config.CANDIDATE_STRIKES)
+  underlying = opts_dict.get("underlying") or opts_dict.get("index") or getattr(config, "UNDERLYING", "SENSEX")
+  exchange = opts_dict.get("exchange") or config.EXCHANGE
+  qty = opts_dict.get("qty") or opts_dict.get("lotsize") or int(config.QTY)
 
   payload = {
       "date": now.strftime("%Y-%m-%d"),
       "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
       "options": {
-          "index": (options_res or {}).get("index", "SENSEX"),
-          "direction": (options_res or {}).get("direction", "PE"),
+          "underlying": underlying,
+          "index": underlying,
+          "direction": opts_dict.get("direction", "PE"),
           "exchange": exchange,
           "qty": int(qty),
-          "expiry": (options_res or {}).get("expiry"),
-          "spot": (options_res or {}).get("spot"),
+          "expiry": opts_dict.get("expiry"),
+          "dte": opts_dict.get("dte"),
+          "spot": opts_dict.get("spot"),
           "candidate_strikes": strikes,
       },
       "equity": {
@@ -88,7 +92,12 @@ def launch_tmux_engines(launch_equity: bool, attach: bool = False):
 
 def main():
   parser = argparse.ArgumentParser(description="Hands-free Morning Screener & Tmux Launcher")
-  parser.add_argument("--index", default="SENSEX", choices=["SENSEX", "NIFTY"], help="Options index")
+  parser.add_argument(
+      "--index",
+      default="AUTO",
+      choices=["AUTO", "SENSEX", "NIFTY"],
+      help="Options index (default: AUTO dynamic rotation by MIN_DTE)",
+  )
   parser.add_argument("--direction", default=None, choices=["CE", "PE"], help="Options CE/PE (defaults to regime-aligned)")
   parser.add_argument("--spot", type=float, default=None, help="Optional manual spot override")
   parser.add_argument("--dry-run", action="store_true", help="Run screeners and save daily_targets.json without launching tmux")
