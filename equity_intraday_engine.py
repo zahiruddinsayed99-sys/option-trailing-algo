@@ -683,7 +683,7 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
 
   except KeyboardInterrupt:
     print("\n[USER INTERRUPT] Stopping Equity Engine safely...")
-    if in_trade:
+    if in_trade and not headless:
       print(f"[CRITICAL WARNING] Active position open in {active_sym} ({direction} {qty} shares).")
       ans = input("Square-off active position now at Market? [y/N]: ").strip().lower()
       if ans == "y":
@@ -696,5 +696,18 @@ def run_equity_engine(custom_symbols=None, custom_direction=None, headless=False
 
 
 if __name__ == "__main__":
-  is_headless = "--headless" in sys.argv or "--sim" in sys.argv or os.getenv("HEADLESS") == "1"
-  run_equity_engine(headless=is_headless)
+  is_headless = (
+      "--headless" in sys.argv
+      or "--auto" in sys.argv
+      or "--sim" in sys.argv
+      or os.getenv("HEADLESS") == "1"
+      or getattr(config, "AUTO_START", False)
+  )
+  if is_headless and getattr(config, "DAILY_EQUITY_LOADED", False) and getattr(config, "EQUITY_WATCHLIST", None):
+    run_equity_engine(
+        custom_symbols=list(config.EQUITY_WATCHLIST),
+        custom_direction=config.EQUITY_DIRECTION,
+        headless=True,
+    )
+  else:
+    run_equity_engine(headless=is_headless)

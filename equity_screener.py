@@ -133,11 +133,11 @@ def _fetch_sensex30_quotes(broker, symbols: list[str], exchange: str) -> dict:
     return quotes_map
 
 
-def select_trending_sensex_stocks(broker):
+def select_trending_sensex_stocks(broker, return_details=False):
     """Checks Sensex-30 basket market regime and selects top 3 trending stocks.
 
     Returns:
-        tuple: (regime, direction, selected_symbols)
+        tuple or dict: (regime, direction, selected_symbols) or details dict if return_details=True
     """
     print("\n" + "=" * 84)
     print("   NSE CASH EQUITY INTRADAY MOMENTUM ENGINE (V1.0) - SENSEX 30 SCREENER")
@@ -150,6 +150,10 @@ def select_trending_sensex_stocks(broker):
     max_notional = getattr(config, "EQUITY_MAX_NOTIONAL", 25000.0)
 
     quotes_map = _fetch_sensex30_quotes(broker, symbols, exchange)
+    valid_equity_quotes = sum(
+        1 for q in quotes_map.values()
+        if isinstance(q, dict) and float(q.get("ltp", 0) or 0) > 0
+    )
 
     pct_moves = []
     for sym, q in quotes_map.items():
@@ -165,6 +169,14 @@ def select_trending_sensex_stocks(broker):
             f"[ERROR] Insufficient Sensex-30 breadth ({len(pct_moves)}/30 valid quotes). Standing down."
         )
         print("[TIP] If OpenAlgo was restarted mid-day, restart OpenAlgo cleanly and verify broker login.")
+        if return_details:
+            return {
+                "regime": "SIDEWAYS",
+                "direction": "NONE",
+                "avg_move_pct": 0.0,
+                "watchlist": [],
+                "valid_quotes": valid_equity_quotes,
+            }
         return "SIDEWAYS", "NONE", []
 
     index_pct_change = sum(pct_moves) / len(pct_moves)
@@ -191,6 +203,14 @@ def select_trending_sensex_stocks(broker):
     if regime == "SIDEWAYS":
         print(f"\n[ACTION REQUIRED] Standing down: SENSEX-30 basket is sideways (< ±{trend_threshold:.2f}%). No trades.")
         print("=" * 84)
+        if return_details:
+            return {
+                "regime": regime,
+                "direction": direction,
+                "avg_move_pct": round(index_pct_change, 4),
+                "watchlist": [],
+                "valid_quotes": valid_equity_quotes,
+            }
         return regime, direction, []
 
     max_affordable_price = max_notional / 5.0
@@ -254,6 +274,14 @@ def select_trending_sensex_stocks(broker):
     if not top_3:
         print(f"\n[NOTE] No Sensex-30 stocks met >= ±{stock_min_move:.2f}% move with <= 0.10% spread & <= ₹{max_affordable_price:.0f} LTP.")
         print("=" * 84)
+        if return_details:
+            return {
+                "regime": regime,
+                "direction": direction,
+                "avg_move_pct": round(index_pct_change, 4),
+                "watchlist": [],
+                "valid_quotes": valid_equity_quotes,
+            }
         return regime, direction, []
 
     print(f"\n{'SYMBOL':<14} | {'LTP':>9} | {'% CHG':>7} | {'VOLUME':>10} | {'RVOL':>5} | {'SPREAD %':>8} | {'DIR':<5} | {'SCORE':>6}")
@@ -270,6 +298,14 @@ def select_trending_sensex_stocks(broker):
     print(f"SELECTED TOP {len(selected_symbols)} ({direction}): {selected_symbols}")
     print("=" * 84 + "\n")
 
+    if return_details:
+        return {
+            "regime": regime,
+            "direction": direction,
+            "avg_move_pct": round(index_pct_change, 4),
+            "watchlist": selected_symbols,
+            "valid_quotes": valid_equity_quotes,
+        }
     return regime, direction, selected_symbols
 
 

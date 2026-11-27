@@ -18,6 +18,7 @@ class BrokerAdapter:
     self._quote_cache = {}
     self._last_rest_quote_ts = 0.0
     self.sim_step = 0
+    self.sim_opt_vol = 0.0
     self.sim_regime = os.getenv("SIM_REGIME", "BULLISH").upper()
     self.sim_equity_steps = {}
     self.sim_prices = [
@@ -29,7 +30,7 @@ class BrokerAdapter:
         198.0, 205.0, 212.0, 222.0,  # Candle 6 (+1.5R Breakeven)
         235.0, 250.0, 265.0, 280.0,  # Candle 7 (+2.5R -> +1R Profit Lock)
         295.0, 315.0, 335.0, 340.0,  # Candle 8 (+50% Surge -> Stage 2 Trail)
-        335.0, 315.0, 295.0, 285.0,  # Candle 9 (Pullback -> Trailing SL / 9 EMA Exit)
+        335.0, 315.0, 295.0, 278.0,  # Candle 9 (Pullback -> Stage 2 Trailing SL Exit)
     ]
 
     # Pre-configured simulated price progressions for Cash Equities (BULLISH & BEARISH)
@@ -115,6 +116,31 @@ class BrokerAdapter:
       except Exception:
         pass
 
+  def subscribe_batch(self, symbols, exchange):
+    """Upfront batch WebSocket subscription so strike rotation incurs zero REST/429 delays."""
+    if not symbols:
+      return
+    if self.mode == "SIMULATION":
+      with self._sub_lock:
+        for sym in symbols:
+          self.subscribed.add((sym, exchange))
+      return
+    if not self.ws_connected or not self.client:
+      return
+    with self._sub_lock:
+      pending = [sym for sym in symbols if (sym, exchange) not in self.subscribed]
+      if not pending:
+        return
+      try:
+        payload = [{"symbol": sym, "exchange": exchange} for sym in pending]
+        self.client.subscribe_quote(payload)
+        for sym in pending:
+          self.subscribed.add((sym, exchange))
+        time.sleep(0.8)  # Allow initial WebSocket snapshots to populate for all strikes
+        print(f"[WS BATCH] Subscribed upfront to {len(pending)} strikes on {exchange}.")
+      except Exception as e:
+        print(f"[WS BATCH WARNING] Batch subscription failed: {e}")
+
   @staticmethod
   def _parse_depth_payload(data):
     """Strict depth parser: prevents false ₹0.00 spread when broker sends bid=0/ask=0."""
@@ -189,6 +215,52 @@ class BrokerAdapter:
       current_time += datetime.timedelta(minutes=3)
     return candles
 
+  def _get_sim_option_history(self, symbol, interval="3m"):
+    """Generates prior-day + current-day 3m option candles aligned with sim_prices for instant hydration."""
+    candles = []
+    today = datetime.date.today()
+    prev_day = today - datetime.timedelta(days=1)
+    if prev_day.weekday() >= 5:  # Skip weekend to Friday
+      prev_day -= datetime.timedelta(days=prev_day.weekday() - 4)
+
+    # 25 prior-day afternoon candles (14:00 - 15:12) trending gently 170 -> 180
+    prev_t = datetime.datetime.combine(prev_day, datetime.time(14, 0))
+    for i in range(25):
+      base = 170.0 + (i * 0.4)
+      o = round(base, 2)
+      c = round(base + 0.5, 2)
+      h = round(max(o, c) + 1.2, 2)
+      l = round(min(o, c) - 1.2, 2)
+      candles.append({
+          "timestamp": prev_t.strftime("%Y-%m-%d %H:%M:%S"),
+          "open": o,
+          "high": h,
+          "low": l,
+          "close": c,
+          "volume": 34000.0 + (i % 5) * 1500.0,
+      })
+      prev_t += datetime.timedelta(minutes=3)
+
+    # 5 current-day opening candles (09:15 - 09:27) holding 180 -> 184 above VWAP
+    curr_t = datetime.datetime.combine(today, datetime.time(9, 15))
+    for i in range(5):
+      base = 180.0 + (i * 0.8)
+      o = round(base, 2)
+      c = round(base + 0.6, 2)
+      h = round(max(o, c) + 1.0, 2)
+      l = round(min(o, c) - 1.0, 2)
+      candles.append({
+          "timestamp": curr_t.strftime("%Y-%m-%d %H:%M:%S"),
+          "open": o,
+          "high": h,
+          "low": l,
+          "close": c,
+          "volume": 36000.0 + (i * 1000.0),
+      })
+      curr_t += datetime.timedelta(minutes=3)
+
+    return candles
+
   def _get_sim_multiquotes(self, symbols, exchange="NSE"):
     """Generates deterministic mock quotes for the 30 Sensex constituent symbols in SIMULATION."""
     results = {}
@@ -251,10 +323,10 @@ class BrokerAdapter:
       }
     return results
 
-  def get_quote(self, symbol, exchange, advance_sim=True):
+  def get_quote(self, symbol, exchange, advance_sim=True, allow_rest=True):
     if self.mode == "SIMULATION":
-      # 1. Sensex Index spot quote
-      if symbol in ("SENSEX", "BSE:SENSEX") or (exchange == "BSE" and not any(k in symbol for k in ("PE", "CE"))):
+      # 1. Index spot quotes (SENSEX / NIFTY)
+      if symbol in ("SENSEX", "BSE:SENSEX") or (exchange in ("BSE", "BSE_INDEX") and not any(k in symbol for k in ("PE", "CE"))):
         if self.sim_regime == "BULLISH":
           ltp = 83500.0
           prev_close = 83100.0
@@ -275,6 +347,27 @@ class BrokerAdapter:
             "bid": round(ltp - 1.0, 2),
             "ask": round(ltp + 1.0, 2),
             "spread": 2.0,
+            "valid_depth": True,
+        }
+
+      if symbol in ("NIFTY", "NSE:NIFTY") or (exchange in ("NSE", "NSE_INDEX") and symbol == "NIFTY"):
+        if self.sim_regime == "BULLISH":
+          ltp, prev_close = 26250.0, 26100.0
+        elif self.sim_regime == "BEARISH":
+          ltp, prev_close = 25950.0, 26100.0
+        else:
+          ltp, prev_close = 26115.0, 26100.0
+        return {
+            "symbol": symbol,
+            "ltp": ltp,
+            "prev_close": prev_close,
+            "open": 26105.0,
+            "high": max(ltp, prev_close) + 20.0,
+            "low": min(ltp, prev_close) - 20.0,
+            "volume": 0.0,
+            "bid": round(ltp - 0.5, 2),
+            "ask": round(ltp + 0.5, 2),
+            "spread": 1.0,
             "valid_depth": True,
         }
 
@@ -300,10 +393,12 @@ class BrokerAdapter:
             "low": round(price - 0.50, 2),
         }
 
-      # 3. Default Options simulation series (preserves V3.4 behavior)
+      # 3. Default Options simulation series (with realistic cumulative volume surge on Candle 5)
       idx = min(self.sim_step, len(self.sim_prices) - 1)
       price = self.sim_prices[idx]
       if advance_sim:
+        vol_inc = 18000.0 if 16 <= idx <= 19 else 8000.0
+        self.sim_opt_vol += vol_inc
         self.sim_step += 1
       return {
           "symbol": symbol,
@@ -312,11 +407,10 @@ class BrokerAdapter:
           "ask": round(price + 0.15, 2),
           "spread": 0.30,
           "valid_depth": True,
-          "volume": 50000.0,
+          "volume": self.sim_opt_vol,
           "prev_close": price - 1.0,
           "open": price,
       }
-
 
     # 1. Primary: Zero-REST OpenAlgo WebSocket cache
     if self.ws_connected:
@@ -332,6 +426,13 @@ class BrokerAdapter:
             return parsed
       except Exception:
         pass
+
+      if not allow_rest:
+        with self._quote_lock:
+          cached = self._quote_cache.get((symbol, exchange))
+          if cached and (time.monotonic() - cached[0]) <= 5.0:
+            return cached[1]
+        return None
 
     # 2. Short-TTL Cache & Throttled Single-Batch Multiquote Fallback (Zero 429 / Zero false None)
     with self._quote_lock:
@@ -506,6 +607,30 @@ class BrokerAdapter:
     except Exception as e:
       print(f"[HISTORY WARNING] Failed to fetch history for {symbol}: {e}")
       return []
+
+  def fetch_multi_day_history(self, symbol, exchange="NFO", interval="3m", lookback_days=4):
+    """Fetches prior-day + current-day 3m candles for instant VWAP, EMA 9/21, and Vol SMA20 hydration."""
+    is_option = exchange in ("NFO", "BFO") or symbol.endswith(("CE", "PE"))
+    if self.mode == "SIMULATION" or not self.client:
+      return self._get_sim_option_history(symbol, interval) if is_option else self._get_sim_history(symbol, exchange, interval)
+
+    today_dt = datetime.date.today()
+    today_str = today_dt.strftime("%Y-%m-%d")
+    start_str = (today_dt - datetime.timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    candles = self.fetch_intraday_history(
+        symbol, exchange, interval=interval, start_date=start_str, end_date=today_str
+    )
+    if not candles:
+      candles = self.fetch_intraday_history(
+          symbol, exchange, interval=interval, start_date=today_str, end_date=today_str
+      )
+
+    if not candles:
+      return []
+
+    candles.sort(key=lambda c: str(c.get("timestamp", "")))
+    return candles[-150:]
 
   def fetch_freeze_hour_base(self, symbol, exchange):
       """Backfills configured Freeze Box 3m candles if started late or on symbol rotation."""

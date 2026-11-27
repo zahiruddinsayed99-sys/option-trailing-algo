@@ -5,3 +5,4 @@ __pycache__/
 *.csv
 *.bak
 config_local.py
+daily_targets.json

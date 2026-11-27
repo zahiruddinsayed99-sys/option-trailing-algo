@@ -1,6 +1,7 @@
 import csv
 import datetime
 import os
+import sys
 import time
 from broker_adapter import BrokerAdapter
 import config
@@ -20,11 +21,6 @@ EXPECTED_HEADER = [
     "Cumulative_Daily_PnL",
 ]
 CANDLE_SEC = 180             # Strict 3-minute wall-clock candles
-MAX_RISK_PER_TRADE = 500.0   # Dynamic ₹500 max risk per trade (25 pts SENSEX / 7.7 pts NIFTY)
-CHASE_GUARD_PCT = 0.05       # Max 5% breakout extension above Base High
-MAX_SPREAD_INDEX = 1.00      # Max ₹1.00 bid-ask spread for index options
-MAX_SPREAD_STOCK = 0.15      # Max ₹0.15 bid-ask spread for stock options
-MIN_OBSERVE_CANDLES = 4      # Minimum 4 candles (12 mins) if started late
 MAX_QUOTE_FAILURES = 10      # Circuit breaker threshold (~20-30s dead feed)
 
 
@@ -35,6 +31,22 @@ def _parse_hhmm(hhmm_str, default_time):
     return datetime.time(h, m)
   except Exception:
     return default_time
+
+
+def _is_today_candle(ts_str, today_str):
+  """Returns True if candle timestamp belongs to today's trading session."""
+  s = str(ts_str or "").strip()
+  if not s:
+    return False
+  if s.startswith(today_str):
+    return True
+  try:
+    today_dmy = datetime.datetime.strptime(today_str, "%Y-%m-%d").strftime("%d-%m-%Y")
+    if s.startswith(today_dmy):
+      return True
+  except Exception:
+    pass
+  return False
 
 
 def init_csv():
@@ -94,6 +106,7 @@ def log_trade(row):
 
 
 def compute_ema(closes, period=9):
+  """Computes Exponential Moving Average over a sequence of close prices."""
   if not closes:
     return 0.0
   k = 2.0 / (period + 1)
@@ -103,59 +116,153 @@ def compute_ema(closes, period=9):
   return ema
 
 
+def compute_sma(values, period=20):
+  """Computes Simple Moving Average over the trailing `period` observations."""
+  if not values:
+    return 0.0
+  window = values[-period:]
+  return sum(window) / len(window)
+
+
 def current_candle_bucket():
   now = datetime.datetime.now()
   return (now.hour * 3600 + now.minute * 60 + now.second) // CANDLE_SEC
 
 
-def sync_strike_history(broker, state, sym, exchange):
-  """Hydrates configured Freeze Box base_high/base_low on OTM rotation."""
+def sync_strike_indicators(broker, state, sym, exchange):
+  """Hydrates prior-day + current-day 3m candles for instant VWAP, EMA 9/21, and Vol SMA20."""
   st = state[sym]
-  if st["base_high"] is not None:
+  if st.get("hydrated"):
     return
-  bh, bl, hist_candles = broker.fetch_freeze_hour_base(sym, exchange)
-  if bh is not None and bl is not None:
-    st["base_high"] = bh
-    st["base_low"] = bl
-    if hist_candles:
-      st["candles"] = hist_candles
-    print(
-        f"[BASE SYNCED | {sym}] Hydrated Freeze-Box Base from history:"
-        f" [{bl:.2f} - {bh:.2f}] ({len(hist_candles)} candles)"
-    )
+
+  t0 = time.perf_counter()
+  hist_candles = broker.fetch_multi_day_history(sym, exchange, interval="3m", lookback_days=4)
+  today_str = datetime.date.today().strftime("%Y-%m-%d")
+
+  # Drop an in-progress live bucket candle from REST history so it is not double-counted
+  if config.MODE != "SIMULATION" and hist_candles:
+    last_ts = str(hist_candles[-1].get("timestamp", ""))
+    if _is_today_candle(last_ts, today_str):
+      try:
+        t_part = last_ts.split(" ")[1][:5] if " " in last_ts else last_ts[:5]
+        c_t = _parse_hhmm(t_part, None)
+        if c_t is not None:
+          c_bucket = (c_t.hour * 3600 + c_t.minute * 60) // CANDLE_SEC
+          if c_bucket == current_candle_bucket():
+            hist_candles = hist_candles[:-1]
+      except Exception:
+        pass
+
+  sum_pv = 0.0
+  sum_vol = 0.0
+  for c in hist_candles:
+    if _is_today_candle(c.get("timestamp", ""), today_str):
+      vol = float(c.get("volume", 0.0) or 0.0)
+      typ_px = (c["high"] + c["low"] + c["close"]) / 3.0
+      sum_pv += typ_px * vol
+      sum_vol += vol
+
+  st["candles"] = list(hist_candles)
+  st["sum_pv"] = sum_pv
+  st["sum_vol"] = sum_vol
+  if sum_vol > 0:
+    st["session_vwap"] = round(sum_pv / sum_vol, 2)
+  elif hist_candles:
+    st["session_vwap"] = round(hist_candles[-1]["close"], 2)
+  else:
+    st["session_vwap"] = 0.0
+  st["hydrated"] = True
+
+  elapsed = time.perf_counter() - t0
+  closes = [c["close"] for c in st["candles"]]
+  ema9 = compute_ema(closes, period=9)
+  ema21 = compute_ema(closes, period=21)
+  vol_sma20 = compute_sma([c.get("volume", 0.0) for c in st["candles"]], period=20)
+  print(
+      f"\n[HYDRATED | {sym}] {len(hist_candles)} 3m candles in {elapsed:.2f}s"
+      f" | VWAP: ₹{st['session_vwap']:.2f} | 9 EMA: ₹{ema9:.2f}"
+      f" | 21 EMA: ₹{ema21:.2f} | Vol SMA20: {int(vol_sma20)}"
+  )
 
 
-def run_v3_engine():
+def _execute_exit(
+    broker,
+    active_sym,
+    exchange,
+    qty,
+    entry_price,
+    highest_price,
+    stage,
+    exit_reason,
+    fallback_px,
+    charges_per_trade,
+    daily_pnl,
+    trades_today,
+    now,
+):
+  """Places exit order, logs atomic trade record, and returns (success, new_daily_pnl, new_trades_today)."""
+  exit_resp = broker.place_market_order(active_sym, exchange, "SELL", qty)
+  if not exit_resp or exit_resp.get("status") != "success":
+    return False, daily_pnl, trades_today
+
+  exit_px = exit_resp["fill_price"] if exit_resp["fill_price"] > 0 else fallback_px
+  gross = round((exit_px - entry_price) * qty, 2)
+  net = round(gross - charges_per_trade, 2)
+  new_daily_pnl = round(daily_pnl + net, 2)
+  new_trades_today = trades_today + 1
+  print(
+      f"\n[EXIT EXECUTED] {active_sym} @ ₹{exit_px:.2f} | Reason: {exit_reason}"
+      f" | Net P&L: ₹{net:.2f} | Daily P&L: ₹{new_daily_pnl:.2f} | Trades: {new_trades_today}"
+  )
+  log_trade([
+      now.strftime("%Y-%m-%d %H:%M:%S"),
+      active_sym,
+      qty,
+      round(entry_price, 2),
+      round(exit_px, 2),
+      round(highest_price, 2),
+      stage,
+      exit_reason,
+      gross,
+      net,
+      new_daily_pnl,
+  ])
+  return True, new_daily_pnl, new_trades_today
+
+
+def run_v3_engine(auto_mode=False):
   daily_pnl, trades_today = init_csv()
   broker = BrokerAdapter()
 
   default_list = getattr(config, "CANDIDATE_STRIKES", [config.SYMBOL])
   default_str = ",".join(default_list)
+  is_auto = auto_mode or ("--auto" in sys.argv) or ("--sim" in sys.argv) or getattr(config, "AUTO_START", False)
 
-  print("\n=== V3.4 HARDENED MULTI-STRIKE MOMENTUM ENGINE SETUP ===")
-  sym_in = input(f"Candidate Strikes [{default_str}]: ").strip().upper()
-  strikes = [s.strip() for s in sym_in.split(",") if s.strip()] if sym_in else default_list
+  print("\n=== V4.0 CONFLUENCE MULTI-STRIKE MOMENTUM ENGINE SETUP ===")
+  if is_auto:
+    strikes = list(default_list)
+    exchange = config.EXCHANGE
+    qty = int(config.QTY)
+    print(f"[AUTO MODE] Strikes: {strikes} | Exchange: {exchange} | Qty: {qty}")
+  else:
+    sym_in = input(f"Candidate Strikes [{default_str}]: ").strip().upper()
+    strikes = [s.strip() for s in sym_in.split(",") if s.strip()] if sym_in else list(default_list)
 
-  exch_in = input(f"Exchange [{config.EXCHANGE}]: ").strip().upper()
-  exchange = exch_in if exch_in else config.EXCHANGE
+    exch_in = input(f"Exchange [{config.EXCHANGE}]: ").strip().upper()
+    exchange = exch_in if exch_in else config.EXCHANGE
 
-  qty_in = input(f"Quantity [{config.QTY}]: ").strip()
-  qty = int(qty_in) if qty_in else int(config.QTY)
+    qty_in = input(f"Quantity [{config.QTY}]: ").strip()
+    qty = int(qty_in) if qty_in else int(config.QTY)
 
-  # Dynamic capital-normalized premium band & ₹500 max risk SL cap
+  # Dynamic capital-normalized premium band & percentage-based SL / confluence guardrails
   min_cap = getattr(config, "MIN_CAPITAL_PER_LOT", 4000.0)
   max_cap = getattr(config, "MAX_CAPITAL_PER_LOT", 5500.0)
   min_prem = round(min_cap / qty, 2)
   max_prem = round(max_cap / qty, 2)
-  max_sl_points = round(MAX_RISK_PER_TRADE / qty, 2)
+  max_sl_pct = getattr(config, "MAX_SL_PCT", 0.25)
+  max_ema_ext_pct = getattr(config, "MAX_EMA_EXTENSION_PCT", 0.08)
+  vol_surge_mult = getattr(config, "VOLUME_SURGE_MULT", 1.3)
   charges_per_trade = getattr(config, "ESTIMATED_CHARGES_PER_TRADE", 55.0)
-  cost_buffer_pts = round((charges_per_trade / qty) + 0.15, 2)
-
-  max_spread = (
-      MAX_SPREAD_INDEX
-      if any(k in strikes[0] for k in ("NIFTY", "SENSEX", "BANKNIFTY"))
-      else MAX_SPREAD_STOCK
-  )
 
   # Configurable Session Time Windows (IST)
   if config.MODE == "SIMULATION":
@@ -164,8 +271,8 @@ def run_v3_engine():
     window_end = datetime.time(23, 59)
     eod_exit_time = datetime.time(23, 59)
   else:
-    observe_start = _parse_hhmm(getattr(config, "OPTIONS_OBSERVE_START", "10:15"), datetime.time(10, 15))
-    window_start = _parse_hhmm(getattr(config, "OPTIONS_WINDOW_START", "11:00"), datetime.time(11, 0))
+    observe_start = _parse_hhmm(getattr(config, "OPTIONS_OBSERVE_START", "09:15"), datetime.time(9, 15))
+    window_start = _parse_hhmm(getattr(config, "OPTIONS_WINDOW_START", "09:30"), datetime.time(9, 30))
     window_end = _parse_hhmm(getattr(config, "OPTIONS_WINDOW_END", "13:30"), datetime.time(13, 30))
     eod_exit_time = _parse_hhmm(getattr(config, "OPTIONS_EOD_EXIT", "15:15"), datetime.time(15, 15))
 
@@ -173,24 +280,29 @@ def run_v3_engine():
       s: {
           "ticks": [],
           "candles": [],
-          "base_high": None,
-          "base_low": None,
-          "base_locked": False,
+          "sum_pv": 0.0,
+          "sum_vol": 0.0,
+          "session_vwap": 0.0,
+          "candle_start_vol": None,
+          "hydrated": False,
           "last_quote": None,
       }
       for s in strikes
   }
 
+  # Upfront 4-strike WebSocket subscription + instant historical indicator hydration
+  broker.subscribe_batch(strikes, exchange)
   active_idx = 0
   active_sym = strikes[active_idx]
-  late_cutoff_dt = datetime.datetime.combine(datetime.date.today(), window_start) - datetime.timedelta(minutes=12)
-  started_late = (config.MODE != "SIMULATION") and (datetime.datetime.now() >= late_cutoff_dt)
+  sync_strike_indicators(broker, state, active_sym, exchange)
 
   in_trade = False
   entry_price = 0.0
   initial_risk_pts = 0.0
   breakeven_trigger = 0.0
-  profit_lock_trigger = 0.0
+  stage2_r_trigger = 0.0
+  stage2_pct_trigger = 0.0
+  locked_floor = 0.0
   highest_price = 0.0
   stop_loss = 0.0
   stage = "IDLE"
@@ -200,18 +312,20 @@ def run_v3_engine():
   consecutive_quote_failures = 0
   last_rotation_check_ts = 0.0
   max_trades = getattr(config, "MAX_TRADES_PER_DAY", 3)
-  max_daily_loss = getattr(config, "MAX_DAILY_LOSS", -800.0)
+  max_daily_loss = getattr(config, "OPTIONS_DAILY_MAX_LOSS", getattr(config, "MAX_DAILY_LOSS", -1200.0))
 
   last_bucket = current_candle_bucket()
   discard_first_partial_bucket = config.MODE != "SIMULATION"
   sim_ticks_in_bucket = 0
 
   print(
-      f"\n>>> Starting V3.4 Engine [{config.MODE}] | {len(strikes)} Strikes Watched"
-      f" | Freeze [{observe_start.strftime('%H:%M')}-{window_start.strftime('%H:%M')}]"
+      f"\n>>> Starting V4.0 Confluence Engine [{config.MODE}] | {len(strikes)} Strikes Subscribed"
+      f" | Observe [{observe_start.strftime('%H:%M')}]"
       f" | Trade [{window_start.strftime('%H:%M')}-{window_end.strftime('%H:%M')}]"
       f" | Band (₹{min_cap:.0f}-₹{max_cap:.0f}/lot): ₹{min_prem:.2f}-₹{max_prem:.2f}"
-      f" | Max SL: {max_sl_points:.2f} pts | Today's Resume: {trades_today}/{max_trades} trades (₹{daily_pnl:.2f}) <<<"
+      f" | Max SL: {int(max_sl_pct*100)}% | Max Ext: {int(max_ema_ext_pct*100)}% | Vol: {vol_surge_mult}x"
+      f" | Daily Loss Cap: ₹{max_daily_loss:.0f}"
+      f" | Resume: {trades_today}/{max_trades} trades (₹{daily_pnl:.2f}) <<<"
   )
 
   try:
@@ -232,16 +346,36 @@ def run_v3_engine():
         print(f"\n[WINDOW CLOSED] Past {window_end.strftime('%H:%M')} entry cutoff with no open position.")
         break
 
+      # Simulation completion check
+      if config.MODE == "SIMULATION" and broker.sim_step >= len(broker.sim_prices):
+        if not in_trade:
+          print("\n[SIMULATION COMPLETE] All synthetic price ticks processed cleanly.")
+          break
+        elif broker.sim_step >= len(broker.sim_prices) + 8:
+          last_ltp = state[active_sym]["last_quote"]["ltp"] if state[active_sym]["last_quote"] else entry_price
+          ok, daily_pnl, trades_today = _execute_exit(
+              broker, active_sym, exchange, qty, entry_price, highest_price,
+              stage, "SIM_END_SQUAREOFF", last_ltp, charges_per_trade,
+              daily_pnl, trades_today, now,
+          )
+          in_trade = False
+          print("\n[SIMULATION COMPLETE] Closed open simulated trade at series end.")
+          break
+
       # 3. Poll active strike (WebSocket primary + REST fallback + Verified Failsafe Exit)
       q = broker.get_quote(active_sym, exchange)
-      if q:
+      if q and q.get("ltp", 0) > 0:
         consecutive_quote_failures = 0
-        state[active_sym]["last_quote"] = q
-        state[active_sym]["ticks"].append(q["ltp"])
+        st_active = state[active_sym]
+        st_active["last_quote"] = q
+        st_active["ticks"].append(q["ltp"])
+        cur_vol = float(q.get("volume", 0.0) or 0.0)
+        if st_active["candle_start_vol"] is None:
+          st_active["candle_start_vol"] = cur_vol
         if not in_trade and now_t < window_start:
           sp_txt = f"₹{q['spread']:.2f}" if q.get("valid_depth", True) else "NO_DEPTH"
           print(
-              f"  [LIVE TICK] {active_sym} LTP: ₹{q['ltp']:.2f} | Spread: {sp_txt}   ",
+              f"  [LIVE TICK] {active_sym} LTP: ₹{q['ltp']:.2f} | VWAP: ₹{st_active['session_vwap']:.2f} | Spread: {sp_txt}   ",
               end="\r",
               flush=True,
           )
@@ -251,39 +385,32 @@ def run_v3_engine():
           print(f"\n[CRITICAL FEED ALERT] {consecutive_quote_failures} consecutive quote failures on {active_sym}!")
           if in_trade:
             print("[FAIL-SAFE EXIT] Attempting immediate MARKET exit due to broken data feed...")
-            exit_resp = broker.place_market_order(active_sym, exchange, "SELL", qty)
-            if exit_resp and exit_resp.get("status") == "success":
-              last_ltp = (
-                  state[active_sym]["last_quote"]["ltp"]
-                  if state[active_sym]["last_quote"]
-                  else entry_price
-              )
-              exit_px = exit_resp["fill_price"] if exit_resp["fill_price"] > 0 else last_ltp
-              gross = round((exit_px - entry_price) * qty, 2)
-              net = round(gross - charges_per_trade, 2)
-              daily_pnl = round(daily_pnl + net, 2)
-              trades_today += 1
-              log_trade([
-                  now.strftime("%Y-%m-%d %H:%M:%S"),
-                  active_sym,
-                  qty,
-                  round(entry_price, 2),
-                  round(exit_px, 2),
-                  round(highest_price, 2),
-                  stage,
-                  "FEED_FAILURE_FAILSAFE",
-                  gross,
-                  net,
-                  daily_pnl,
-              ])
+            last_ltp = (
+                state[active_sym]["last_quote"]["ltp"]
+                if state[active_sym]["last_quote"]
+                else entry_price
+            )
+            ok, daily_pnl, trades_today = _execute_exit(
+                broker,
+                active_sym,
+                exchange,
+                qty,
+                entry_price,
+                highest_price,
+                stage,
+                "FEED_FAILURE_FAILSAFE",
+                last_ltp,
+                charges_per_trade,
+                daily_pnl,
+                trades_today,
+                now,
+            )
+            if ok:
               in_trade = False
               stage = "IDLE"
+              locked_floor = 0.0
               climax_armed = False
               climax_trigger_price = None
-              state[active_sym]["base_locked"] = False
-              state[active_sym]["candles"].clear()
-              state[active_sym]["base_high"] = None
-              state[active_sym]["base_low"] = None
             else:
               print(
                   f"[FATAL ORDER ALERT] Failsafe SELL failed for {active_sym}!"
@@ -293,7 +420,7 @@ def run_v3_engine():
         time.sleep(2.0)
         continue
 
-      # 4. Dynamic OTM Strike Auto-Rotation (with 15s cooldown to prevent 429 sweeps)
+      # 4. Dynamic OTM Strike Auto-Rotation (Zero REST / Zero 429 via upfront WS subscription)
       if (
           not in_trade
           and len(strikes) > 1
@@ -301,49 +428,53 @@ def run_v3_engine():
           and (time.time() - last_rotation_check_ts) >= 15.0
       ):
         curr_ltp = state[active_sym]["last_quote"]["ltp"]
+        allow_rot_rest = not broker.ws_connected
         if curr_ltp > max_prem and active_idx + 1 < len(strikes):
           last_rotation_check_ts = time.time()
           for next_i in range(active_idx + 1, len(strikes)):
             cand_s = strikes[next_i]
-            time.sleep(0.5)
-            cand_q = broker.get_quote(cand_s, exchange)
+            cand_q = broker.get_quote(cand_s, exchange, advance_sim=False, allow_rest=allow_rot_rest)
             state[cand_s]["last_quote"] = cand_q
             if (
                 cand_q
-                and cand_q.get("valid_depth", True)
+                and cand_q.get("valid_depth", False)
+                and cand_q["ltp"] > 0
                 and cand_q["ltp"] <= max_prem
-                and cand_q["spread"] <= max(max_spread, round(cand_q["ltp"] * 0.005, 2))
+                and cand_q["spread"] <= round(cand_q["ltp"] * 0.005, 4)
             ):
               print(
                   f"\n>>> [OTM ROTATE UP] {active_sym} LTP ₹{curr_ltp:.2f} > ₹{max_prem:.2f}."
                   f" Switching to {cand_s} @ ₹{cand_q['ltp']:.2f} <<<"
               )
               state[active_sym]["ticks"].clear()
+              state[active_sym]["hydrated"] = False
               active_idx = next_i
               active_sym = cand_s
-              sync_strike_history(broker, state, active_sym, exchange)
+              sync_strike_indicators(broker, state, active_sym, exchange)
+              state[active_sym]["candle_start_vol"] = float(cand_q.get("volume", 0.0) or 0.0)
               break
         elif curr_ltp < min_prem and active_idx - 1 >= 0:
           last_rotation_check_ts = time.time()
           for prev_i in range(active_idx - 1, -1, -1):
             cand_s = strikes[prev_i]
-            time.sleep(0.5)
-            cand_q = broker.get_quote(cand_s, exchange)
+            cand_q = broker.get_quote(cand_s, exchange, advance_sim=False, allow_rest=allow_rot_rest)
             state[cand_s]["last_quote"] = cand_q
             if (
                 cand_q
-                and cand_q.get("valid_depth", True)
+                and cand_q.get("valid_depth", False)
                 and min_prem <= cand_q["ltp"] <= max_prem
-                and cand_q["spread"] <= max(max_spread, round(cand_q["ltp"] * 0.005, 2))
+                and cand_q["spread"] <= round(cand_q["ltp"] * 0.005, 4)
             ):
               print(
                   f"\n>>> [OTM ROTATE DOWN] {active_sym} LTP ₹{curr_ltp:.2f} < ₹{min_prem:.2f}."
                   f" Switching back to {cand_s} @ ₹{cand_q['ltp']:.2f} <<<"
               )
               state[active_sym]["ticks"].clear()
+              state[active_sym]["hydrated"] = False
               active_idx = prev_i
               active_sym = cand_s
-              sync_strike_history(broker, state, active_sym, exchange)
+              sync_strike_indicators(broker, state, active_sym, exchange)
+              state[active_sym]["candle_start_vol"] = float(cand_q.get("volume", 0.0) or 0.0)
               break
 
       # 5. Intra-Candle Tick Exit Management
@@ -352,34 +483,31 @@ def run_v3_engine():
         if ltp > highest_price:
           highest_price = ltp
 
-        # Stage 1: 1:1.5 Risk-Reward Cost-Adjusted Breakeven Lock
-        if stage == "INITIAL_BASE_SL" and ltp >= breakeven_trigger:
-          be_with_charges = round(entry_price + cost_buffer_pts, 2)
-          stop_loss = max(stop_loss, be_with_charges)
+        # Stage 1 (>= 1.5R profit): Move SL to cost-adjusted Breakeven (entry_price + 0.30)
+        if stage == "INITIAL_SL" and ltp >= breakeven_trigger:
+          be_sl = round(entry_price + 0.30, 2)
+          stop_loss = max(stop_loss, be_sl)
           stage = "STAGE1_1.5R_BREAKEVEN"
           print(
               f"\n[STAGE 1: 1.5R BREAKEVEN] {active_sym} hit ₹{ltp:.2f} (>= ₹{breakeven_trigger:.2f})."
-              f" SL locked at Net Cost: ₹{stop_loss:.2f}"
+              f" SL moved to Breakeven: ₹{stop_loss:.2f}"
           )
 
-        # Stage 1.5: 1:2.5 Risk-Reward -> Lock +1R Guaranteed Profit Floor
-        if stage in ("INITIAL_BASE_SL", "STAGE1_1.5R_BREAKEVEN") and ltp >= profit_lock_trigger:
-          one_r_floor = round(entry_price + initial_risk_pts, 2)
-          stop_loss = max(stop_loss, one_r_floor)
-          stage = "STAGE1.5_2.5R_LOCK_1R"
-          print(
-              f"\n[STAGE 1.5: 2.5R PROFIT LOCK] {active_sym} hit ₹{ltp:.2f} (>= ₹{profit_lock_trigger:.2f})."
-              f" SL locked at +1R: ₹{stop_loss:.2f}"
-          )
-
-        # Stage 2: +50% Profit Surge -> Lock +25% Floor
-        if ltp >= entry_price * 1.50 and stage != "STAGE2_PROFIT_TRAIL":
-          stop_loss = max(stop_loss, round(entry_price * 1.25, 2))
+        # Stage 2 (>= +50% premium gain OR >= 2.0R profit): Lock minimum +25% floor & activate candle trail
+        pct25_floor = round(entry_price * 1.25, 2)
+        if stage != "STAGE2_PROFIT_TRAIL" and (ltp >= stage2_pct_trigger or ltp >= stage2_r_trigger):
+          # Guard against setting SL above LTP when 2.0R < +25% (tight structural SL)
+          locked_floor = pct25_floor if ltp >= pct25_floor + 0.50 else round(entry_price + initial_risk_pts, 2)
+          stop_loss = max(stop_loss, locked_floor)
           stage = "STAGE2_PROFIT_TRAIL"
           print(
-              f"\n[STAGE 2: +50% SURGE] {active_sym} hit ₹{ltp:.2f}."
-              f" Floor SL locked at +25%: ₹{stop_loss:.2f}"
+              f"\n[STAGE 2: PROFIT TRAIL ACTIVE] {active_sym} hit ₹{ltp:.2f}."
+              f" Floor SL locked at ₹{stop_loss:.2f}"
           )
+        elif stage == "STAGE2_PROFIT_TRAIL" and locked_floor < pct25_floor and (ltp >= stage2_pct_trigger or ltp >= pct25_floor + 0.50):
+          locked_floor = pct25_floor
+          stop_loss = max(stop_loss, locked_floor)
+          print(f"\n[STAGE 2: +25% FLOOR LOCKED] {active_sym} hit ₹{ltp:.2f}. Floor raised to ₹{locked_floor:.2f}")
 
         exit_reason = None
         if ltp <= stop_loss:
@@ -390,38 +518,27 @@ def run_v3_engine():
           exit_reason = "EOD_SQUARE_OFF"
 
         if exit_reason:
-          exit_resp = broker.place_market_order(active_sym, exchange, "SELL", qty)
-          if exit_resp and exit_resp.get("status") == "success":
-            exit_px = exit_resp["fill_price"] if exit_resp["fill_price"] > 0 else ltp
-            gross = round((exit_px - entry_price) * qty, 2)
-            net = round(gross - charges_per_trade, 2)
-            daily_pnl = round(daily_pnl + net, 2)
-            trades_today += 1
-            print(
-                f"\n[EXIT EXECUTED] {active_sym} @ ₹{exit_px:.2f} | Reason: {exit_reason}"
-                f" | Net P&L: ₹{net:.2f} | Daily P&L: ₹{daily_pnl:.2f} | Trades: {trades_today}/{max_trades}"
-            )
-            log_trade([
-                now.strftime("%Y-%m-%d %H:%M:%S"),
-                active_sym,
-                qty,
-                round(entry_price, 2),
-                round(exit_px, 2),
-                round(highest_price, 2),
-                stage,
-                exit_reason,
-                gross,
-                net,
-                daily_pnl,
-            ])
+          ok, daily_pnl, trades_today = _execute_exit(
+              broker,
+              active_sym,
+              exchange,
+              qty,
+              entry_price,
+              highest_price,
+              stage,
+              exit_reason,
+              ltp,
+              charges_per_trade,
+              daily_pnl,
+              trades_today,
+              now,
+          )
+          if ok:
             in_trade = False
             stage = "IDLE"
+            locked_floor = 0.0
             climax_armed = False
             climax_trigger_price = None
-            state[active_sym]["base_locked"] = False
-            state[active_sym]["candles"].clear()
-            state[active_sym]["base_high"] = None
-            state[active_sym]["base_low"] = None
             continue
           else:
             print(f"[EXIT RETRY ALERT] SELL order rejected for {active_sym} on {exit_reason} — will retry next tick!")
@@ -445,6 +562,8 @@ def run_v3_engine():
         if discard_first_partial_bucket:
           discard_first_partial_bucket = False
           st["ticks"].clear()
+          if st["last_quote"]:
+            st["candle_start_vol"] = float(st["last_quote"].get("volume", 0.0) or 0.0)
           print("\n[SYNC] Discarded truncated startup candle; aligned to clean 3-minute boundary.")
           continue
 
@@ -454,133 +573,154 @@ def run_v3_engine():
         c_close = st["ticks"][-1]
         st["ticks"].clear()
 
-        # Ignore pre-observe_start opening bell spikes
+        cur_vol = float(st["last_quote"].get("volume", 0.0) or 0.0) if st["last_quote"] else 0.0
+        start_vol = st["candle_start_vol"] if st["candle_start_vol"] is not None else cur_vol
+        c_volume = max(0.0, cur_vol - start_vol) if cur_vol >= start_vol else 0.0
+        if cur_vol > 0:
+          st["candle_start_vol"] = cur_vol
+
+        # Ignore pre-observe_start opening bell ticks
         if now_t < observe_start:
           continue
 
-        candle = {"open": c_open, "high": c_high, "low": c_low, "close": c_close}
+        candle = {
+            "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "open": c_open,
+            "high": c_high,
+            "low": c_low,
+            "close": c_close,
+            "volume": c_volume,
+        }
+        prior_candles = list(st["candles"])
         st["candles"].append(candle)
+
+        # Incrementally update Session VWAP on every closed 3m candle
+        if c_volume > 0:
+          typ_px = (c_high + c_low + c_close) / 3.0
+          st["sum_pv"] += typ_px * c_volume
+          st["sum_vol"] += c_volume
+        if st["sum_vol"] > 0:
+          st["session_vwap"] = round(st["sum_pv"] / st["sum_vol"], 2)
+        elif st["session_vwap"] <= 0:
+          st["session_vwap"] = round(c_close, 2)
+
         closes = [c["close"] for c in st["candles"]]
         ema9 = compute_ema(closes, period=9)
+        ema21 = compute_ema(closes, period=21)
+        vol_sma20 = compute_sma([c.get("volume", 0.0) for c in prior_candles], period=20)
+        session_vwap = st["session_vwap"]
 
-        need_warmup = (
-            st["base_high"] is None
-            or (started_late and len(st["candles"]) <= MIN_OBSERVE_CANDLES)
-        )
-
-        # PHASE A: Bounded Freeze-Box Base Observation (configured via OPTIONS_OBSERVE_START - OPTIONS_WINDOW_START)
-        if now_t < window_start or need_warmup:
-          st["base_high"] = (
-              c_high if st["base_high"] is None else max(st["base_high"], c_high)
-          )
-          st["base_low"] = (
-              c_low if st["base_low"] is None else min(st["base_low"], c_low)
-          )
+        # PHASE A: Pre-Window Observation (e.g. 09:15 - 09:30)
+        if now_t < window_start:
           print(
-              f"\n[BASE OBSERVE #{len(st['candles'])} | {active_sym}]"
-              f" Close: {c_close:.2f} | Base: [{st['base_low']:.2f} - {st['base_high']:.2f}]"
+              f"\n[PRE-WINDOW 3M | {active_sym}] Close: {c_close:.2f} | VWAP: {session_vwap:.2f}"
+              f" | 9EMA: {ema9:.2f} | 21EMA: {ema21:.2f} | Vol: {int(c_volume)} / SMA20: {int(vol_sma20)}"
           )
 
-        # PHASE B: Active Entry Hunting (configured via OPTIONS_WINDOW_START - OPTIONS_WINDOW_END)
+        # PHASE B: VWAP + 9/21 EMA + Volume Confluence Entry Hunting
         elif not in_trade:
-          if not st["base_locked"]:
-            st["base_locked"] = True
-            print(
-                f"\n>>> [BASE LOCKED | {active_sym}] High: {st['base_high']:.2f}"
-                f" | Low: {st['base_low']:.2f} | Hunting Breakouts <<<"
-            )
+          q_now = st["last_quote"]
+          valid_depth = bool(q_now and q_now.get("valid_depth", False))
+          ltp_now = q_now["ltp"] if q_now else c_close
+          spread_now = q_now["spread"] if q_now else 999.0
+          spread_pct = (spread_now / ltp_now) * 100.0 if ltp_now > 0 else 999.0
+          ext_pct = ((c_close - ema9) / ema9) * 100.0 if ema9 > 0 else 0.0
+          vol_ratio = (c_volume / vol_sma20) if vol_sma20 > 0 else 0.0
 
-          valid_depth = st["last_quote"].get("valid_depth", True) if st["last_quote"] else False
-          spread_now = st["last_quote"]["spread"] if st["last_quote"] else 999.0
-          sp_disp = f"₹{spread_now:.2f}" if valid_depth else "NO_DEPTH"
+          sp_disp = f"{spread_pct:.2f}%" if valid_depth else "NO_DEPTH"
           print(
-              f"[SCANNING 3M | {active_sym}] Close: {c_close:.2f}"
-              f" | Base High: {st['base_high']:.2f} | 9 EMA: {ema9:.2f} | Spread: {sp_disp}"
+              f"[SCANNING 3M | {active_sym}] C:{c_close:.2f} | VWAP:{session_vwap:.2f}"
+              f" | 9E:{ema9:.2f} | 21E:{ema21:.2f} | Ext:{ext_pct:+.1f}%"
+              f" | Vol:{vol_ratio:.2f}x | Spr:{sp_disp}"
           )
 
-          if c_close > st["base_high"]:
-            chase_limit = st["base_high"] * (1.0 + CHASE_GUARD_PCT)
-            if not valid_depth:
-              print("[SKIP BREAKOUT] Missing live bid/ask depth.")
-            elif c_close > chase_limit:
-              print(
-                  f"[SKIP BREAKOUT] Close {c_close:.2f} > 5% Chase Guard ({chase_limit:.2f})."
+          cond_vwap = session_vwap > 0 and c_close > session_vwap
+          cond_ema = len(closes) >= 21 and ema9 > ema21 and c_close > ema9
+          cond_vol = vol_sma20 > 0 and c_volume >= (vol_surge_mult * vol_sma20)
+          cond_ext = ema9 > 0 and c_close <= (ema9 * (1.0 + max_ema_ext_pct))
+          cond_spread = valid_depth and ltp_now > 0 and spread_now <= (ltp_now * 0.005)
+
+          if cond_vwap and cond_ema and cond_vol and cond_ext and cond_spread:
+            order_resp = broker.place_market_order(active_sym, exchange, "BUY", qty)
+            if order_resp and order_resp.get("status") == "success":
+              in_trade = True
+              entry_price = (
+                  order_resp["fill_price"]
+                  if order_resp["fill_price"] > 0
+                  else c_close
               )
-            elif spread_now > max(max_spread, round(c_close * 0.005, 2)):
-              eff_spread = max(max_spread, round(c_close * 0.005, 2))
+              highest_price = entry_price
+
+              recent_3_low = min(c["low"] for c in st["candles"][-3:])
+              structural_sl = round(min(recent_3_low, ema21) - 0.50, 2)
+              pct_cap_sl = round(entry_price * (1.0 - max_sl_pct), 2)
+              initial_sl = max(structural_sl, pct_cap_sl)
+              if initial_sl >= entry_price:
+                initial_sl = pct_cap_sl
+
+              stop_loss = initial_sl
+              initial_risk_pts = max(0.50, round(entry_price - initial_sl, 2))
+              breakeven_trigger = round(entry_price + (1.5 * initial_risk_pts), 2)
+              stage2_r_trigger = round(entry_price + (2.0 * initial_risk_pts), 2)
+              stage2_pct_trigger = round(entry_price * 1.50, 2)
+              locked_floor = 0.0
+              stage = "INITIAL_SL"
+              climax_armed = False
+              climax_trigger_price = None
               print(
-                  f"[SKIP BREAKOUT] Spread ₹{spread_now:.2f} > Max ₹{eff_spread:.2f}."
+                  f"\n>>> [CONFLUENCE ENTRY] BUY {qty} {active_sym} @ ₹{entry_price:.2f}"
+                  f" | Structural SL: ₹{structural_sl:.2f} | 25% Cap: ₹{pct_cap_sl:.2f}"
+                  f" | Active SL: ₹{stop_loss:.2f} (R: {initial_risk_pts:.2f} pts / ₹{initial_risk_pts*qty:.0f})"
+                  f" | 1.5R BE: ₹{breakeven_trigger:.2f} | Stage2: ₹{min(stage2_r_trigger, stage2_pct_trigger):.2f} <<<"
               )
-            else:
-              order_resp = broker.place_market_order(active_sym, exchange, "BUY", qty)
-              if order_resp and order_resp.get("status") == "success":
-                in_trade = True
-                entry_price = (
-                    order_resp["fill_price"]
-                    if order_resp["fill_price"] > 0
-                    else c_close
-                )
-                highest_price = entry_price
+          elif cond_vwap and cond_ema:
+            reasons = []
+            if not cond_vol:
+              reasons.append(f"Vol {vol_ratio:.2f}x < {vol_surge_mult}x")
+            if not cond_ext:
+              reasons.append(f"Ext {ext_pct:+.1f}% > +{max_ema_ext_pct*100:.0f}% (wait 9EMA pullback)")
+            if not cond_spread:
+              reasons.append(f"Spread/Depth invalid ({sp_disp})")
+            if reasons:
+              print(f"[SKIP CONFLUENCE | {active_sym}] " + " | ".join(reasons))
 
-                raw_sl_pts = entry_price - st["base_low"]
-                if raw_sl_pts <= 0 or raw_sl_pts > max_sl_points:
-                  stop_loss = round(entry_price - max_sl_points, 2)
-                else:
-                  stop_loss = round(st["base_low"], 2)
-
-                initial_risk_pts = round(entry_price - stop_loss, 2)
-                breakeven_trigger = round(entry_price + (1.5 * initial_risk_pts), 2)
-                profit_lock_trigger = round(entry_price + (2.5 * initial_risk_pts), 2)
-                stage = "INITIAL_BASE_SL"
-                climax_armed = False
-                climax_trigger_price = None
-                print(
-                    f"\n>>> [ENTRY TRIGGERED] BUY {qty} {active_sym} @ ₹{entry_price:.2f}"
-                    f" | SL: ₹{stop_loss:.2f} (Risk: {initial_risk_pts:.2f} pts / ₹{initial_risk_pts*qty:.0f})"
-                    f" | 1.5R BE: ₹{breakeven_trigger:.2f} | 2.5R +1R Lock: ₹{profit_lock_trigger:.2f} <<<"
-                )
-
-        # PHASE C: Candle-Close Trailing & Momentum Exit
+        # PHASE C: Candle-Close Staged Trailing & Climax-Wick Protection
         else:
           candles = st["candles"]
           if stage == "STAGE2_PROFIT_TRAIL" and len(candles) >= 2:
-            two_candle_low = min(candles[-1]["low"], candles[-2]["low"])
-            if two_candle_low > stop_loss:
-              stop_loss = round(two_candle_low, 2)
-              print(f"[STAGE 2 TRAIL] 2-Candle Low SL raised to ₹{stop_loss:.2f}")
+            prev_2_candle_low = min(candles[-1]["low"], candles[-2]["low"])
+            trail_candidate = round(max(locked_floor, min(prev_2_candle_low, ema9 - 1.50)), 2)
+            if trail_candidate > stop_loss:
+              stop_loss = trail_candidate
+              print(
+                  f"\n[STAGE 2 TRAIL | {active_sym}] SL raised to ₹{stop_loss:.2f}"
+                  f" (Floor: ₹{locked_floor:.2f} | 2C-Low: ₹{prev_2_candle_low:.2f} | 9EMA-1.50: ₹{ema9 - 1.50:.2f})"
+              )
 
           # 1-Candle Climax Wick Verification (auto-disarms if next candle holds above trigger)
           if climax_armed:
             if c_close < climax_trigger_price:
-              exit_resp = broker.place_market_order(active_sym, exchange, "SELL", qty)
-              if exit_resp and exit_resp.get("status") == "success":
-                exit_px = exit_resp["fill_price"] if exit_resp["fill_price"] > 0 else c_close
-                gross = round((exit_px - entry_price) * qty, 2)
-                net = round(gross - charges_per_trade, 2)
-                daily_pnl = round(daily_pnl + net, 2)
-                trades_today += 1
-                print(f"\n[CLIMAX EXIT] {active_sym} @ ₹{exit_px:.2f} | Net P&L: ₹{net:.2f}")
-                log_trade([
-                    now.strftime("%Y-%m-%d %H:%M:%S"),
-                    active_sym,
-                    qty,
-                    round(entry_price, 2),
-                    round(exit_px, 2),
-                    round(highest_price, 2),
-                    stage,
-                    "CLIMAX_WICK_EXIT",
-                    gross,
-                    net,
-                    daily_pnl,
-                ])
+              ok, daily_pnl, trades_today = _execute_exit(
+                  broker,
+                  active_sym,
+                  exchange,
+                  qty,
+                  entry_price,
+                  highest_price,
+                  stage,
+                  "CLIMAX_WICK_EXIT",
+                  c_close,
+                  charges_per_trade,
+                  daily_pnl,
+                  trades_today,
+                  now,
+              )
+              if ok:
                 in_trade = False
                 stage = "IDLE"
+                locked_floor = 0.0
                 climax_armed = False
                 climax_trigger_price = None
-                state[active_sym]["base_locked"] = False
-                state[active_sym]["candles"].clear()
-                state[active_sym]["base_high"] = None
-                state[active_sym]["base_low"] = None
                 continue
             else:
               print(
@@ -607,41 +747,6 @@ def run_v3_engine():
                 f"[CLIMAX WICK ARMED] Exit armed ONLY for next candle if close < {climax_trigger_price:.2f}"
             )
 
-          if stage == "STAGE2_PROFIT_TRAIL" and len(closes) >= 9 and c_close < ema9:
-            exit_resp = broker.place_market_order(active_sym, exchange, "SELL", qty)
-            if exit_resp and exit_resp.get("status") == "success":
-              exit_px = exit_resp["fill_price"] if exit_resp["fill_price"] > 0 else c_close
-              gross = round((exit_px - entry_price) * qty, 2)
-              net = round(gross - charges_per_trade, 2)
-              daily_pnl = round(daily_pnl + net, 2)
-              trades_today += 1
-              print(
-                  f"\n[STAGE 3: 9 EMA EXIT] {active_sym} closed ₹{c_close:.2f} < 9 EMA ₹{ema9:.2f}"
-                  f" | Net P&L: ₹{net:.2f}"
-              )
-              log_trade([
-                  now.strftime("%Y-%m-%d %H:%M:%S"),
-                  active_sym,
-                  qty,
-                  round(entry_price, 2),
-                  round(exit_px, 2),
-                  round(highest_price, 2),
-                  stage,
-                  "9_EMA_MOMENTUM_EXIT",
-                  gross,
-                  net,
-                  daily_pnl,
-              ])
-              in_trade = False
-              stage = "IDLE"
-              climax_armed = False
-              climax_trigger_price = None
-              state[active_sym]["base_locked"] = False
-              state[active_sym]["candles"].clear()
-              state[active_sym]["base_high"] = None
-              state[active_sym]["base_low"] = None
-              continue
-
       if in_trade and state[active_sym]["last_quote"]:
         ltp = state[active_sym]["last_quote"]["ltp"]
         unrealized = round((ltp - entry_price) * qty, 2)
@@ -651,7 +756,7 @@ def run_v3_engine():
             f" | SL: {stop_loss:.2f} | 1.5R BE: {breakeven_trigger:.2f} | P&L: ₹{unrealized:.1f}"
         )
 
-      time.sleep(0.3 if config.MODE == "SIMULATION" else 1.5)
+      time.sleep(0.05 if config.MODE == "SIMULATION" else 1.5)
 
   except KeyboardInterrupt:
     print("\n[STOPPED] Engine manually terminated by user.")
